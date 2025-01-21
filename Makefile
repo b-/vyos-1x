@@ -28,7 +28,7 @@ interface_definitions: $(config_xml_obj)
 
 	find $(BUILD_DIR)/interface-definitions -type f -name "*.xml" | xargs -I {} $(CURDIR)/scripts/build-command-templates {} $(CURDIR)/schema/interface_definition.rng $(TMPL_DIR) || exit 1
 
-	$(CURDIR)/python/vyos/xml_ref/generate_cache.py --xml-dir $(BUILD_DIR)/interface-definitions || exit 1
+	$(CURDIR)/python/vyos/xml_ref/generate_cache.py --xml-dir $(BUILD_DIR)/interface-definitions --internal-cache $(DATA_DIR)/reftree.cache || exit 1
 
 	# XXX: delete top level node.def's that now live in other packages
 	# IPSec VPN EAP-RADIUS does not support source-address
@@ -55,11 +55,7 @@ op_mode_definitions: $(op_xml_obj)
 
 	find $(BUILD_DIR)/op-mode-definitions/ -type f -name "*.xml" | xargs -I {} $(CURDIR)/scripts/build-command-op-templates {} $(CURDIR)/schema/op-mode-definition.rng $(OP_TMPL_DIR) || exit 1
 
-	# XXX: delete top level op mode node.def's that now live in other packages
-	rm -f $(OP_TMPL_DIR)/add/node.def
-	rm -f $(OP_TMPL_DIR)/clear/interfaces/node.def
-	rm -f $(OP_TMPL_DIR)/clear/node.def
-	rm -f $(OP_TMPL_DIR)/delete/node.def
+	$(CURDIR)/python/vyos/xml_ref/generate_op_cache.py --xml-dir $(BUILD_DIR)/op-mode-definitions || exit 1
 
 	# XXX: tcpdump, ping, traceroute and mtr must be able to recursivly call themselves as the
 	# options are provided from the scripts themselves
@@ -68,6 +64,7 @@ op_mode_definitions: $(op_xml_obj)
 	ln -s ../node.tag $(OP_TMPL_DIR)/mtr/node.tag/node.tag/
 	ln -s ../node.tag $(OP_TMPL_DIR)/monitor/traceroute/node.tag/node.tag/
 	ln -s ../node.tag $(OP_TMPL_DIR)/monitor/traffic/interface/node.tag/node.tag/
+	ln -s ../node.tag $(OP_TMPL_DIR)/execute/port-scan/host/node.tag/node.tag/
 
 	# XXX: test if there are empty node.def files - this is not allowed as these
 	# could mask help strings or mandatory priority statements

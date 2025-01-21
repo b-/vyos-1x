@@ -41,6 +41,18 @@
                       </valueHelp>
                     </properties>
                   </leafNode>
+                  <leafNode name="secret-type">
+                    <properties>
+                      <help>Secret type</help>
+                      <completionHelp>
+                        <list>base64 plaintext</list>
+                      </completionHelp>
+                      <constraint>
+                        <regex>(base64|plaintext)</regex>
+                      </constraint>
+                    </properties>
+                    <defaultValue>plaintext</defaultValue>
+                  </leafNode>
                 </children>
               </tagNode>
             </children>
@@ -97,6 +109,12 @@
                   <constraint>
                     <validator name="numeric" argument="--range 1000-26843545600000"/>
                   </constraint>
+                </properties>
+              </leafNode>
+              <leafNode name="disable-rekey">
+                <properties>
+                  <help>Do not locally initiate a re-key of the SA, remote peer must re-key before expiration</help>
+                  <valueless/>
                 </properties>
               </leafNode>
               <leafNode name="mode">
@@ -704,18 +722,7 @@
                   <help>Authentication</help>
                 </properties>
                 <children>
-                  <leafNode name="mode">
-                    <properties>
-                      <help>Authentication mode</help>
-                      <completionHelp>
-                        <list>pre-shared-secret</list>
-                      </completionHelp>
-                      <valueHelp>
-                        <format>pre-shared-secret</format>
-                        <description>Use a pre-shared secret key</description>
-                      </valueHelp>
-                    </properties>
-                  </leafNode>
+                  #include <include/auth-mode-pre-shared-secret.xml.i>
                   #include <include/ipsec/authentication-pre-shared-secret.xml.i>
                 </children>
               </node>
@@ -848,6 +855,7 @@
                   #include <include/dhcp-interface.xml.i>
                   #include <include/ipsec/local-traffic-selector.xml.i>
                   #include <include/ipsec/replay-window.xml.i>
+                  #include <include/ipsec/bind.xml.i>
                   <leafNode name="timeout">
                     <properties>
                       <help>Timeout to close connection if no data is transmitted</help>
@@ -972,6 +980,45 @@
                       </constraint>
                     </properties>
                   </leafNode>
+                  <node name="range">
+                    <properties>
+                      <help>Local IPv4 or IPv6 pool range</help>
+                    </properties>
+                    <children>
+                      <leafNode name="start">
+                        <properties>
+                          <help>First IP address for local pool range</help>
+                          <valueHelp>
+                            <format>ipv4</format>
+                            <description>IPv4 start address of pool</description>
+                          </valueHelp>
+                          <valueHelp>
+                            <format>ipv6</format>
+                            <description>IPv6 start address of pool</description>
+                          </valueHelp>
+                          <constraint>
+                            <validator name="ip-address"/>
+                          </constraint>
+                        </properties>
+                      </leafNode>
+                      <leafNode name="stop">
+                        <properties>
+                          <help>Last IP address for local pool range</help>
+                          <valueHelp>
+                            <format>ipv4</format>
+                            <description>IPv4 end address of pool</description>
+                          </valueHelp>
+                          <valueHelp>
+                            <format>ipv6</format>
+                            <description>IPv6 end address of pool</description>
+                          </valueHelp>
+                          <constraint>
+                            <validator name="ip-address"/>
+                          </constraint>
+                        </properties>
+                      </leafNode>
+                    </children>
+                  </node>
                   #include <include/name-server-ipv4-ipv6.xml.i>
                 </children>
               </tagNode>
@@ -1195,14 +1242,7 @@
                       <help>Virtual tunnel interface</help>
                     </properties>
                     <children>
-                      <leafNode name="bind">
-                        <properties>
-                          <help>VTI tunnel interface associated with this configuration</help>
-                          <completionHelp>
-                            <path>interfaces vti</path>
-                          </completionHelp>
-                        </properties>
-                      </leafNode>
+                      #include <include/ipsec/bind.xml.i>
                       #include <include/ipsec/esp-group.xml.i>
                     </children>
                   </node>

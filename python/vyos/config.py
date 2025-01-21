@@ -140,6 +140,7 @@ class Config(object):
 
         self._level = []
         self._dict_cache = {}
+        self.dependency_list = []
         (self._running_config,
          self._session_config) = self._config_source.get_configtree_tuple()
 
@@ -342,6 +343,9 @@ class Config(object):
                             certificate, pki_dict['certificate'][certificate])
 
             conf_dict['pki'] = pki_dict
+
+        interfaces_root = root_dict.get('interfaces', {})
+        setattr(conf_dict, 'interfaces_root', interfaces_root)
 
         # save optional args for a call to get_config_defaults
         setattr(conf_dict, '_dict_kwargs', kwargs)

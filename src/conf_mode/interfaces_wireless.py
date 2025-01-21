@@ -19,6 +19,7 @@ import os
 from sys import exit
 from re import findall
 from netaddr import EUI, mac_unix_expanded
+from time import sleep
 
 from vyos.config import Config
 from vyos.configdict import get_interface_dict
@@ -34,6 +35,9 @@ from vyos.template import render
 from vyos.utils.dict import dict_search
 from vyos.utils.kernel import check_kmod
 from vyos.utils.process import call
+from vyos.utils.process import is_systemd_service_active
+from vyos.utils.process import is_systemd_service_running
+from vyos.utils.network import interface_exists
 from vyos import ConfigError
 from vyos import airbag
 airbag.enable()
@@ -93,6 +97,11 @@ def get_config(config=None):
         if wifi.from_defaults(['security', 'wpa']): # if not set by user
             del wifi['security']['wpa']
 
+    # XXX: Jinja2 can not operate on a dictionary key when it starts of with a number
+    if '40mhz_incapable' in (dict_search('capabilities.ht', wifi) or []):
+        wifi['capabilities']['ht']['fourtymhz_incapable'] = wifi['capabilities']['ht']['40mhz_incapable']
+        del wifi['capabilities']['ht']['40mhz_incapable']
+
     if dict_search('security.wpa', wifi) != None:
         wpa_cipher = wifi['security']['wpa'].get('cipher')
         wpa_mode = wifi['security']['wpa'].get('mode')
@@ -120,7 +129,7 @@ def get_config(config=None):
     tmp = find_other_stations(conf, base, wifi['ifname'])
     if tmp: wifi['station_interfaces'] = tmp
 
-    # used in hostapt.conf.j2
+    # used in hostapd.conf.j2
     wifi['hostapd_accept_station_conf'] = hostapd_accept_station_conf.format(**wifi)
     wifi['hostapd_deny_station_conf'] = hostapd_deny_station_conf.format(**wifi)
 
@@ -184,11 +193,18 @@ def verify(wifi):
             if not any(i in ['passphrase', 'radius'] for i in wpa):
                 raise ConfigError('Misssing WPA key or RADIUS server')
 
+            if 'username' in wpa:
+                if 'passphrase' not in wpa:
+                    raise ConfigError('WPA-Enterprise configured - missing passphrase!')
+            elif 'passphrase' in wpa:
+                # check if passphrase meets the regex .{8,63}
+                if len(wpa['passphrase']) < 8 or len(wpa['passphrase']) > 63:
+                    raise ConfigError('WPA passphrase must be between 8 and 63 characters long')
             if 'radius' in wpa:
                 if 'server' in wpa['radius']:
                     for server in wpa['radius']['server']:
                         if 'key' not in wpa['radius']['server'][server]:
-                            raise ConfigError(f'Misssing RADIUS shared secret key for server: {server}')
+                            raise ConfigError(f'Missing RADIUS shared secret key for server: {server}')
 
     if 'capabilities' in wifi:
         capabilities = wifi['capabilities']
@@ -223,12 +239,9 @@ def verify(wifi):
     return None
 
 def generate(wifi):
-    interface = wifi['ifname']
+    check_kmod('mac80211')
 
-    # always stop hostapd service first before reconfiguring it
-    call(f'systemctl stop hostapd@{interface}.service')
-    # always stop wpa_supplicant service first before reconfiguring it
-    call(f'systemctl stop wpa_supplicant@{interface}.service')
+    interface = wifi['ifname']
 
     # Delete config files if interface is removed
     if 'deleted' in wifi:
@@ -265,11 +278,6 @@ def generate(wifi):
             mac.dialect = mac_unix_expanded
             wifi['mac'] = str(mac)
 
-    # XXX: Jinja2 can not operate on a dictionary key when it starts of with a number
-    if '40mhz_incapable' in (dict_search('capabilities.ht', wifi) or []):
-        wifi['capabilities']['ht']['fourtymhz_incapable'] = wifi['capabilities']['ht']['40mhz_incapable']
-        del wifi['capabilities']['ht']['40mhz_incapable']
-
     # render appropriate new config files depending on access-point or station mode
     if wifi['type'] == 'access-point':
         render(hostapd_conf.format(**wifi), 'wifi/hostapd.conf.j2', wifi)
@@ -283,29 +291,50 @@ def generate(wifi):
 
 def apply(wifi):
     interface = wifi['ifname']
+    # From systemd source code:
+    # If there's a stop job queued before we enter the DEAD state, we shouldn't act on Restart=,
+    # in order to not undo what has already been enqueued. */
+    #
+    # It was found that calling restart on hostapd will (4 out of 10 cases) deactivate
+    # the service instead of restarting it, when it was not yet properly stopped
+    # systemd[1]: hostapd@wlan1.service: Deactivated successfully.
+    # Thus kill all WIFI service and start them again after it's ensured nothing lives
+    call(f'systemctl stop hostapd@{interface}.service')
+    call(f'systemctl stop wpa_supplicant@{interface}.service')
+
     if 'deleted' in wifi:
-        WiFiIf(interface).remove()
-    else:
-        # Finally create the new interface
-        w = WiFiIf(**wifi)
-        w.update(wifi)
+        WiFiIf(**wifi).remove()
+        return None
 
-        # Enable/Disable interface - interface is always placed in
-        # administrative down state in WiFiIf class
-        if 'disable' not in wifi:
-            # Physical interface is now configured. Proceed by starting hostapd or
-            # wpa_supplicant daemon. When type is monitor we can just skip this.
-            if wifi['type'] == 'access-point':
-                call(f'systemctl start hostapd@{interface}.service')
+    while (is_systemd_service_running(f'hostapd@{interface}.service') or \
+           is_systemd_service_active(f'hostapd@{interface}.service')):
+        sleep(0.250) # wait 250ms
 
-            elif wifi['type'] == 'station':
-                call(f'systemctl start wpa_supplicant@{interface}.service')
+    # Finally create the new interface
+    w = WiFiIf(**wifi)
+    w.update(wifi)
+
+    # Enable/Disable interface - interface is always placed in
+    # administrative down state in WiFiIf class
+    if 'disable' not in wifi:
+        # Wait until interface was properly added to the Kernel
+        ii = 0
+        while not (interface_exists(interface) and ii < 20):
+            sleep(0.250) # wait 250ms
+            ii += 1
+
+        # Physical interface is now configured. Proceed by starting hostapd or
+        # wpa_supplicant daemon. When type is monitor we can just skip this.
+        if wifi['type'] == 'access-point':
+            call(f'systemctl start hostapd@{interface}.service')
+
+        elif wifi['type'] == 'station':
+            call(f'systemctl start wpa_supplicant@{interface}.service')
 
     return None
 
 if __name__ == '__main__':
     try:
-        check_kmod('mac80211')
         c = get_config()
         verify(c)
         generate(c)

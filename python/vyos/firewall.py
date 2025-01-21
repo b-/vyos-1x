@@ -30,6 +30,9 @@ from vyos.utils.dict import dict_search_args
 from vyos.utils.dict import dict_search_recursive
 from vyos.utils.process import cmd
 from vyos.utils.process import run
+from vyos.utils.network import get_vrf_tableid
+from vyos.defaults import rt_global_table
+from vyos.defaults import rt_global_vrf
 
 # Conntrack
 def conntrack_required(conf):
@@ -50,25 +53,32 @@ def conntrack_required(conf):
 
 # Domain Resolver
 
-def fqdn_config_parse(firewall):
-    firewall['ip_fqdn'] = {}
-    firewall['ip6_fqdn'] = {}
+def fqdn_config_parse(config, node):
+    config['ip_fqdn'] = {}
+    config['ip6_fqdn'] = {}
 
-    for domain, path in dict_search_recursive(firewall, 'fqdn'):
-        hook_name = path[1]
-        priority = path[2]
+    for domain, path in dict_search_recursive(config, 'fqdn'):
+        if node != 'nat':
+            hook_name = path[1]
+            priority = path[2]
 
-        fw_name = path[2]
-        rule = path[4]
-        suffix = path[5][0]
-        set_name = f'{hook_name}_{priority}_{rule}_{suffix}'
+            rule = path[4]
+            suffix = path[5][0]
+            set_name = f'{hook_name}_{priority}_{rule}_{suffix}'
 
-        if (path[0] == 'ipv4') and (path[1] == 'forward' or path[1] == 'input' or path[1] == 'output' or path[1] == 'name'):
-            firewall['ip_fqdn'][set_name] = domain
-        elif (path[0] == 'ipv6') and (path[1] == 'forward' or path[1] == 'input' or path[1] == 'output' or path[1] == 'name'):
-            if path[1] == 'name':
-                set_name = f'name6_{priority}_{rule}_{suffix}'
-            firewall['ip6_fqdn'][set_name] = domain
+            if (path[0] == 'ipv4') and (path[1] == 'forward' or path[1] == 'input' or path[1] == 'output' or path[1] == 'name'):
+                config['ip_fqdn'][set_name] = domain
+            elif (path[0] == 'ipv6') and (path[1] == 'forward' or path[1] == 'input' or path[1] == 'output' or path[1] == 'name'):
+                if path[1] == 'name':
+                    set_name = f'name6_{priority}_{rule}_{suffix}'
+                config['ip6_fqdn'][set_name] = domain
+        else:
+            # Parse FQDN for NAT
+            nat_direction = path[0]
+            nat_rule = path[2]
+            suffix = path[3][0]
+            set_name = f'{nat_direction}_{nat_rule}_{suffix}'
+            config['ip_fqdn'][set_name] = domain
 
 def fqdn_resolve(fqdn, ipv6=False):
     try:
@@ -76,8 +86,6 @@ def fqdn_resolve(fqdn, ipv6=False):
         return set(item[4][0] for item in res)
     except:
         return None
-
-# End Domain Resolver
 
 def find_nftables_rule(table, chain, rule_matches=[]):
     # Find rule in table/chain that matches all criteria and return the handle
@@ -148,6 +156,20 @@ def parse_rule(rule_conf, hook, fw_name, rule_id, ip_name):
             proto = '{tcp, udp}'
         output.append(f'meta l4proto {operator} {proto}')
 
+    if 'ethernet_type' in rule_conf:
+        ether_type_mapping = {
+            '802.1q': '8021q',
+            '802.1ad': '8021ad',
+            'ipv6': 'ip6',
+            'ipv4': 'ip',
+            'arp': 'arp'
+        }
+        ether_type = rule_conf['ethernet_type']
+        operator = '!=' if ether_type.startswith('!') else ''
+        ether_type = ether_type.lstrip('!')
+        ether_type = ether_type_mapping.get(ether_type, ether_type)
+        output.append(f'ether type {operator} {ether_type}')
+
     for side in ['destination', 'source']:
         if side in rule_conf:
             prefix = side[0]
@@ -164,7 +186,19 @@ def parse_rule(rule_conf, hook, fw_name, rule_id, ip_name):
                 if address_mask:
                     operator = '!=' if exclude else '=='
                     operator = f'& {address_mask} {operator} '
-                output.append(f'{ip_name} {prefix}addr {operator}{suffix}')
+
+                if suffix.find('-') != -1:
+                    # Range
+                    start, end = suffix.split('-')
+                    if is_ipv4(start):
+                        output.append(f'ip {prefix}addr {operator}{suffix}')
+                    else:
+                        output.append(f'ip6 {prefix}addr {operator}{suffix}')
+                else:
+                    if is_ipv4(suffix):
+                        output.append(f'ip {prefix}addr {operator}{suffix}')
+                    else:
+                        output.append(f'ip6 {prefix}addr {operator}{suffix}')
 
             if 'fqdn' in side_conf:
                 fqdn = side_conf['fqdn']
@@ -233,22 +267,38 @@ def parse_rule(rule_conf, hook, fw_name, rule_id, ip_name):
 
             if 'group' in side_conf:
                 group = side_conf['group']
-                if 'address_group' in group:
-                    group_name = group['address_group']
-                    operator = ''
-                    exclude = group_name[0] == "!"
-                    if exclude:
-                        operator = '!='
-                        group_name = group_name[1:]
-                    if address_mask:
-                        operator = '!=' if exclude else '=='
-                        operator = f'& {address_mask} {operator}'
-                    output.append(f'{ip_name} {prefix}addr {operator} @A{def_suffix}_{group_name}')
-                elif 'dynamic_address_group' in group:
+                for ipvx_address_group in ['address_group', 'ipv4_address_group', 'ipv6_address_group']:
+                    if ipvx_address_group in group:
+                        group_name = group[ipvx_address_group]
+                        operator = ''
+                        exclude = group_name[0] == "!"
+                        if exclude:
+                            operator = '!='
+                            group_name = group_name[1:]
+                        if address_mask:
+                            operator = '!=' if exclude else '=='
+                            operator = f'& {address_mask} {operator}'
+                        # for bridge, change ip_name
+                        if ip_name == 'bri':
+                            ip_name = 'ip' if ipvx_address_group == 'ipv4_address_group' else 'ip6'
+                            def_suffix = '6' if ipvx_address_group == 'ipv6_address_group' else ''
+                        output.append(f'{ip_name} {prefix}addr {operator} @A{def_suffix}_{group_name}')
+                for ipvx_network_group in ['network_group', 'ipv4_network_group', 'ipv6_network_group']:
+                    if ipvx_network_group in group:
+                        group_name = group[ipvx_network_group]
+                        operator = ''
+                        if group_name[0] == "!":
+                            operator = '!='
+                            group_name = group_name[1:]
+                        # for bridge, change ip_name
+                        if ip_name == 'bri':
+                            ip_name = 'ip' if ipvx_network_group == 'ipv4_network_group' else 'ip6'
+                            def_suffix = '6' if ipvx_network_group == 'ipv6_network_group' else ''
+                        output.append(f'{ip_name} {prefix}addr {operator} @N{def_suffix}_{group_name}')
+                if 'dynamic_address_group' in group:
                     group_name = group['dynamic_address_group']
                     operator = ''
-                    exclude = group_name[0] == "!"
-                    if exclude:
+                    if group_name[0] == "!":
                         operator = '!='
                         group_name = group_name[1:]
                     output.append(f'{ip_name} {prefix}addr {operator} @DA{def_suffix}_{group_name}')
@@ -260,13 +310,6 @@ def parse_rule(rule_conf, hook, fw_name, rule_id, ip_name):
                         operator = '!='
                         group_name = group_name[1:]
                     output.append(f'{ip_name} {prefix}addr {operator} @D_{group_name}')
-                elif 'network_group' in group:
-                    group_name = group['network_group']
-                    operator = ''
-                    if group_name[0] == '!':
-                        operator = '!='
-                        group_name = group_name[1:]
-                    output.append(f'{ip_name} {prefix}addr {operator} @N{def_suffix}_{group_name}')
                 if 'mac_group' in group:
                     group_name = group['mac_group']
                     operator = ''
@@ -366,10 +409,14 @@ def parse_rule(rule_conf, hook, fw_name, rule_id, ip_name):
         output.append(f'ip{def_suffix} dscp != {{{negated_dscp_str}}}')
 
     if 'ipsec' in rule_conf:
-        if 'match_ipsec' in rule_conf['ipsec']:
+        if 'match_ipsec_in' in rule_conf['ipsec']:
             output.append('meta ipsec == 1')
-        if 'match_none' in rule_conf['ipsec']:
+        if 'match_none_in' in rule_conf['ipsec']:
             output.append('meta ipsec == 0')
+        if 'match_ipsec_out' in rule_conf['ipsec']:
+            output.append('rt ipsec exists')
+        if 'match_none_out' in rule_conf['ipsec']:
+            output.append('rt ipsec missing')
 
     if 'fragment' in rule_conf:
         # Checking for fragmentation after priority -400 is not possible,
@@ -389,6 +436,41 @@ def parse_rule(rule_conf, hook, fw_name, rule_id, ip_name):
         count = rule_conf['recent']['count']
         time = rule_conf['recent']['time']
         output.append(f'add @RECENT{def_suffix}_{hook}_{fw_name}_{rule_id} {{ {ip_name} saddr limit rate over {count}/{time} burst {count} packets }}')
+
+    if 'gre' in rule_conf:
+        gre_key = dict_search_args(rule_conf, 'gre', 'key')
+
+        gre_flags = dict_search_args(rule_conf, 'gre', 'flags')
+        output.append(parse_gre_flags(gre_flags or {}, force_keyed=gre_key is not None))
+
+        gre_proto_alias_map = {
+            '802.1q': '8021q',
+            '802.1ad': '8021ad',
+            'gretap': '0x6558',
+        }
+
+        gre_proto = dict_search_args(rule_conf, 'gre', 'inner_proto')
+        if gre_proto is not None:
+            gre_proto = gre_proto_alias_map.get(gre_proto, gre_proto)
+            output.append(f'gre protocol {gre_proto}')
+
+        gre_ver = dict_search_args(rule_conf, 'gre', 'version')
+        if gre_ver == 'gre':
+            output.append('gre version 0')
+        elif gre_ver == 'pptp':
+            output.append('gre version 1')
+
+        if gre_key:
+            # The offset of the key within the packet shifts depending on the C-flag. 
+            # nftables cannot handle complex enough expressions to match multiple 
+            # offsets based on bitfields elsewhere.
+            # We enforce a specific match for the checksum flag in validation, so the 
+            # gre_flags dict will always have a 'checksum' key when gre_key is populated. 
+            if not gre_flags['checksum']: 
+                # No "unset" child node means C is set, we offset key lookup +32 bits
+                output.append(f'@th,64,32 == {gre_key}')                
+            else:
+                output.append(f'@th,32,32 == {gre_key}')
 
     if 'time' in rule_conf:
         output.append(parse_time(rule_conf['time']))
@@ -419,6 +501,19 @@ def parse_rule(rule_conf, hook, fw_name, rule_id, ip_name):
             output.append(f'vlan id {rule_conf["vlan"]["id"]}')
         if 'priority' in rule_conf['vlan']:
             output.append(f'vlan pcp {rule_conf["vlan"]["priority"]}')
+        if 'ethernet_type' in rule_conf['vlan']:
+            ether_type_mapping = {
+                '802.1q': '8021q',
+                '802.1ad': '8021ad',
+                'ipv6': 'ip6',
+                'ipv4': 'ip',
+                'arp': 'arp'
+            }
+            ether_type = rule_conf['vlan']['ethernet_type']
+            operator = '!=' if ether_type.startswith('!') else ''
+            ether_type = ether_type.lstrip('!')
+            ether_type = ether_type_mapping.get(ether_type, ether_type)
+            output.append(f'vlan type {operator} {ether_type}')
 
     if 'log' in rule_conf:
         action = rule_conf['action'] if 'action' in rule_conf else 'accept'
@@ -469,16 +564,31 @@ def parse_rule(rule_conf, hook, fw_name, rule_id, ip_name):
         if 'mark' in rule_conf['set']:
             mark = rule_conf['set']['mark']
             output.append(f'meta mark set {mark}')
+        if 'vrf' in rule_conf['set']:
+            set_table = True
+            vrf_name = rule_conf['set']['vrf']
+            if vrf_name == 'default':
+                table = rt_global_vrf
+            else:
+                # NOTE: VRF->table ID lookup depends on the VRF iface already existing.
+                table = get_vrf_tableid(vrf_name)
         if 'table' in rule_conf['set']:
             set_table = True
             table = rule_conf['set']['table']
             if table == 'main':
-                table = '254'
+                table = rt_global_table
+        if set_table:
             mark = 0x7FFFFFFF - int(table)
             output.append(f'meta mark set {mark}')
         if 'tcp_mss' in rule_conf['set']:
             mss = rule_conf['set']['tcp_mss']
             output.append(f'tcp option maxseg size set {mss}')
+        if 'ttl' in rule_conf['set']:
+            ttl = rule_conf['set']['ttl']
+            output.append(f'ip ttl set {ttl}')
+        if 'hop_limit' in rule_conf['set']:
+            hoplimit = rule_conf['set']['hop_limit']
+            output.append(f'ip6 hoplimit set {hoplimit}')
 
     if 'action' in rule_conf:
         if rule_conf['action'] == 'offload':
@@ -515,6 +625,32 @@ def parse_rule(rule_conf, hook, fw_name, rule_id, ip_name):
 
     output.append(f'comment "{family}-{hook}-{fw_name}-{rule_id}"')
     return " ".join(output)
+
+def parse_gre_flags(flags, force_keyed=False):
+    flag_map = { # nft does not have symbolic names for these. 
+        'checksum': 1<<0,
+        'routing':  1<<1,
+        'key':      1<<2,
+        'sequence': 1<<3,
+        'strict_routing': 1<<4,
+    }
+
+    include = 0
+    exclude = 0
+    for fl_name, fl_state in flags.items():
+        if not fl_state: 
+            include |= flag_map[fl_name]
+        else: # 'unset' child tag
+            exclude |= flag_map[fl_name]
+
+    if force_keyed:
+        # Implied by a key-match.
+        include |= flag_map['key']
+
+    if include == 0 and exclude == 0:
+        return '' # Don't bother extracting and matching no bits
+
+    return f'gre flags & {include + exclude} == {include}'
 
 def parse_tcp_flags(flags):
     include = [flag for flag in flags if flag != 'not']

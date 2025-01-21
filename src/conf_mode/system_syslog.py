@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #
-# Copyright (C) 2018-2023 VyOS maintainers and contributors
+# Copyright (C) 2018-2024 VyOS maintainers and contributors
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License version 2 or later as
@@ -18,6 +18,7 @@ import os
 
 from sys import exit
 
+from vyos.base import Warning
 from vyos.config import Config
 from vyos.configdict import is_node_changed
 from vyos.configverify import verify_vrf
@@ -52,11 +53,28 @@ def get_config(config=None):
     if syslog.from_defaults(['global']):
         del syslog['global']
 
+    if (
+        'global' in syslog
+        and 'preserve_fqdn' in syslog['global']
+        and conf.exists(['system', 'host-name'])
+        and conf.exists(['system', 'domain-name'])
+    ):
+        hostname = conf.return_value(['system', 'host-name'])
+        domain = conf.return_value(['system', 'domain-name'])
+        fqdn = f'{hostname}.{domain}'
+        syslog['global']['local_host_name'] = fqdn
+
     return syslog
 
 def verify(syslog):
     if not syslog:
         return None
+
+    if 'host' in syslog:
+         for host, host_options in syslog['host'].items():
+             if 'protocol' in host_options and host_options['protocol'] == 'udp':
+                 if 'format' in host_options and 'octet_counted' in host_options['format']:
+                     Warning(f'Syslog UDP transport for "{host}" should not use octet-counted format!')
 
     verify_vrf(syslog)
 

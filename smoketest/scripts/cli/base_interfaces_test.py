@@ -12,31 +12,110 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+import re
+
 from netifaces import AF_INET
 from netifaces import AF_INET6
 from netifaces import ifaddresses
-from netifaces import interfaces
 
 from base_vyostest_shim import VyOSUnitTestSHIM
+from base_vyostest_shim import CSTORE_GUARD_TIME
 
 from vyos.configsession import ConfigSessionError
 from vyos.defaults import directories
 from vyos.ifconfig import Interface
 from vyos.ifconfig import Section
+from vyos.pki import CERT_BEGIN
 from vyos.utils.file import read_file
 from vyos.utils.dict import dict_search
+from vyos.utils.process import cmd
 from vyos.utils.process import process_named_running
 from vyos.utils.network import get_interface_config
 from vyos.utils.network import get_interface_vrf
-from vyos.utils.process import cmd
+from vyos.utils.network import get_vrf_tableid
+from vyos.utils.network import interface_exists
 from vyos.utils.network import is_intf_addr_assigned
 from vyos.utils.network import is_ipv6_link_local
+from vyos.utils.network import get_nft_vrf_zone_mapping
 from vyos.xml_ref import cli_defined
 
 dhclient_base_dir = directories['isc_dhclient_dir']
 dhclient_process_name = 'dhclient'
 dhcp6c_base_dir = directories['dhcp6_client_dir']
 dhcp6c_process_name = 'dhcp6c'
+
+server_ca_root_cert_data = """
+MIIBcTCCARagAwIBAgIUDcAf1oIQV+6WRaW7NPcSnECQ/lUwCgYIKoZIzj0EAwIw
+HjEcMBoGA1UEAwwTVnlPUyBzZXJ2ZXIgcm9vdCBDQTAeFw0yMjAyMTcxOTQxMjBa
+Fw0zMjAyMTUxOTQxMjBaMB4xHDAaBgNVBAMME1Z5T1Mgc2VydmVyIHJvb3QgQ0Ew
+WTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAQ0y24GzKQf4aM2Ir12tI9yITOIzAUj
+ZXyJeCmYI6uAnyAMqc4Q4NKyfq3nBi4XP87cs1jlC1P2BZ8MsjL5MdGWozIwMDAP
+BgNVHRMBAf8EBTADAQH/MB0GA1UdDgQWBBRwC/YaieMEnjhYa7K3Flw/o0SFuzAK
+BggqhkjOPQQDAgNJADBGAiEAh3qEj8vScsjAdBy5shXzXDVVOKWCPTdGrPKnu8UW
+a2cCIQDlDgkzWmn5ujc5ATKz1fj+Se/aeqwh4QyoWCVTFLIxhQ==
+"""
+
+server_ca_intermediate_cert_data = """
+MIIBmTCCAT+gAwIBAgIUNzrtHzLmi3QpPK57tUgCnJZhXXQwCgYIKoZIzj0EAwIw
+HjEcMBoGA1UEAwwTVnlPUyBzZXJ2ZXIgcm9vdCBDQTAeFw0yMjAyMTcxOTQxMjFa
+Fw0zMjAyMTUxOTQxMjFaMCYxJDAiBgNVBAMMG1Z5T1Mgc2VydmVyIGludGVybWVk
+aWF0ZSBDQTBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABEl2nJ1CzoqPV6hWII2m
+eGN/uieU6wDMECTk/LgG8CCCSYb488dibUiFN/1UFsmoLIdIhkx/6MUCYh62m8U2
+WNujUzBRMA8GA1UdEwEB/wQFMAMBAf8wHQYDVR0OBBYEFMV3YwH88I5gFsFUibbQ
+kMR0ECPsMB8GA1UdIwQYMBaAFHAL9hqJ4wSeOFhrsrcWXD+jRIW7MAoGCCqGSM49
+BAMCA0gAMEUCIQC/ahujD9dp5pMMCd3SZddqGC9cXtOwMN0JR3e5CxP13AIgIMQm
+jMYrinFoInxmX64HfshYqnUY8608nK9D2BNPOHo=
+"""
+
+client_ca_root_cert_data = """
+MIIBcDCCARagAwIBAgIUZmoW2xVdwkZSvglnkCq0AHKa6zIwCgYIKoZIzj0EAwIw
+HjEcMBoGA1UEAwwTVnlPUyBjbGllbnQgcm9vdCBDQTAeFw0yMjAyMTcxOTQxMjFa
+Fw0zMjAyMTUxOTQxMjFaMB4xHDAaBgNVBAMME1Z5T1MgY2xpZW50IHJvb3QgQ0Ew
+WTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAATUpKXzQk2NOVKDN4VULk2yw4mOKPvn
+mg947+VY7lbpfOfAUD0QRg95qZWCw899eKnXp/U4TkAVrmEKhUb6OJTFozIwMDAP
+BgNVHRMBAf8EBTADAQH/MB0GA1UdDgQWBBTXu6xGWUl25X3sBtrhm3BJSICIATAK
+BggqhkjOPQQDAgNIADBFAiEAnTzEwuTI9bz2Oae3LZbjP6f/f50KFJtjLZFDbQz7
+DpYCIDNRHV8zBUibC+zg5PqMpQBKd/oPfNU76nEv6xkp/ijO
+"""
+
+client_ca_intermediate_cert_data = """
+MIIBmDCCAT+gAwIBAgIUJEMdotgqA7wU4XXJvEzDulUAGqgwCgYIKoZIzj0EAwIw
+HjEcMBoGA1UEAwwTVnlPUyBjbGllbnQgcm9vdCBDQTAeFw0yMjAyMTcxOTQxMjJa
+Fw0zMjAyMTUxOTQxMjJaMCYxJDAiBgNVBAMMG1Z5T1MgY2xpZW50IGludGVybWVk
+aWF0ZSBDQTBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABGyIVIi217s9j3O+WQ2b
+6R65/Z0ZjQpELxPjBRc0CA0GFCo+pI5EvwI+jNFArvTAJ5+ZdEWUJ1DQhBKDDQdI
+avCjUzBRMA8GA1UdEwEB/wQFMAMBAf8wHQYDVR0OBBYEFOUS8oNJjChB1Rb9Blcl
+ETvziHJ9MB8GA1UdIwQYMBaAFNe7rEZZSXblfewG2uGbcElIgIgBMAoGCCqGSM49
+BAMCA0cAMEQCIArhaxWgRsAUbEeNHD/ULtstLHxw/P97qPUSROLQld53AiBjgiiz
+9pDfISmpekZYz6bIDWRIR0cXUToZEMFNzNMrQg==
+"""
+
+client_cert_data = """
+MIIBmTCCAUCgAwIBAgIUV5T77XdE/tV82Tk4Vzhp5BIFFm0wCgYIKoZIzj0EAwIw
+JjEkMCIGA1UEAwwbVnlPUyBjbGllbnQgaW50ZXJtZWRpYXRlIENBMB4XDTIyMDIx
+NzE5NDEyMloXDTMyMDIxNTE5NDEyMlowIjEgMB4GA1UEAwwXVnlPUyBjbGllbnQg
+Y2VydGlmaWNhdGUwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAARuyynqfc/qJj5e
+KJ03oOH8X4Z8spDeAPO9WYckMM0ldPj+9kU607szFzPwjaPWzPdgyIWz3hcN8yAh
+CIhytmJao1AwTjAMBgNVHRMBAf8EAjAAMB0GA1UdDgQWBBTIFKrxZ+PqOhYSUqnl
+TGCUmM7wTjAfBgNVHSMEGDAWgBTlEvKDSYwoQdUW/QZXJRE784hyfTAKBggqhkjO
+PQQDAgNHADBEAiAvO8/jvz05xqmP3OXD53XhfxDLMIxzN4KPoCkFqvjlhQIgIHq2
+/geVx3rAOtSps56q/jiDouN/aw01TdpmGKVAa9U=
+"""
+
+client_key_data = """
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgxaxAQsJwjoOCByQE
++qSYKtKtJzbdbOnTsKNSrfgkFH6hRANCAARuyynqfc/qJj5eKJ03oOH8X4Z8spDe
+APO9WYckMM0ldPj+9kU607szFzPwjaPWzPdgyIWz3hcN8yAhCIhytmJa
+"""
+
+def get_wpa_supplicant_value(interface, key):
+    tmp = read_file(f'/run/wpa_supplicant/{interface}.conf')
+    tmp = re.findall(r'\n?{}=(.*)'.format(key), tmp)
+    return tmp[0]
+
+def get_certificate_count(interface, cert_type):
+    tmp = read_file(f'/run/wpa_supplicant/{interface}_{cert_type}.pem')
+    return tmp.count(CERT_BEGIN)
 
 def is_mirrored_to(interface, mirror_if, qdisc):
     """
@@ -55,10 +134,10 @@ def is_mirrored_to(interface, mirror_if, qdisc):
     if mirror_if in tmp:
         ret_val = True
     return ret_val
-
 class BasicInterfaceTest:
     class TestCase(VyOSUnitTestSHIM.TestCase):
         _test_dhcp = False
+        _test_eapol = False
         _test_ip = False
         _test_mtu = False
         _test_vlan = False
@@ -90,6 +169,7 @@ class BasicInterfaceTest:
             cls._test_vlan = cli_defined(cls._base_path, 'vif')
             cls._test_qinq = cli_defined(cls._base_path, 'vif-s')
             cls._test_dhcp = cli_defined(cls._base_path, 'dhcp-options')
+            cls._test_eapol = cli_defined(cls._base_path, 'eapol')
             cls._test_ip = cli_defined(cls._base_path, 'ip')
             cls._test_ipv6 = cli_defined(cls._base_path, 'ipv6')
             cls._test_ipv6_dhcpc6 = cli_defined(cls._base_path, 'dhcpv6-options')
@@ -101,6 +181,9 @@ class BasicInterfaceTest:
             for span in cls._mirror_interfaces:
                 section = Section.section(span)
                 cls.cli_set(cls, ['interfaces', section, span])
+
+            # Enable CSTORE guard time required by FRR related tests
+            cls._commit_guard_time = CSTORE_GUARD_TIME
 
         @classmethod
         def tearDownClass(cls):
@@ -116,8 +199,11 @@ class BasicInterfaceTest:
             self.cli_commit()
 
             # Verify that no previously interface remained on the system
+            ct_map = get_nft_vrf_zone_mapping()
             for intf in self._interfaces:
-                self.assertNotIn(intf, interfaces())
+                self.assertFalse(interface_exists(intf))
+                for map_entry in ct_map:
+                     self.assertNotEqual(intf, map_entry['interface'])
 
             # No daemon started during tests should remain running
             for daemon in ['dhcp6c', 'dhclient']:
@@ -256,6 +342,69 @@ class BasicInterfaceTest:
                 self.assertIn(str(tmp), vrf_pids)
 
             self.cli_delete(['vrf', 'name', vrf_name])
+
+        def test_move_interface_between_vrf_instances(self):
+            if not self._test_vrf:
+                self.skipTest('not supported')
+
+            vrf1_name = 'smoketest_mgmt1'
+            vrf1_table = '5424'
+            vrf2_name = 'smoketest_mgmt2'
+            vrf2_table = '7412'
+
+            self.cli_set(['vrf', 'name', vrf1_name, 'table', vrf1_table])
+            self.cli_set(['vrf', 'name', vrf2_name, 'table', vrf2_table])
+
+            # move interface into first VRF
+            for interface in self._interfaces:
+                for option in self._options.get(interface, []):
+                    self.cli_set(self._base_path + [interface] + option.split())
+                self.cli_set(self._base_path + [interface, 'vrf', vrf1_name])
+
+            self.cli_commit()
+
+            # check that interface belongs to proper VRF
+            for interface in self._interfaces:
+                tmp = get_interface_vrf(interface)
+                self.assertEqual(tmp, vrf1_name)
+
+                tmp = get_interface_config(vrf1_name)
+                self.assertEqual(int(vrf1_table), get_vrf_tableid(interface))
+
+            # move interface into second VRF
+            for interface in self._interfaces:
+                self.cli_set(self._base_path + [interface, 'vrf', vrf2_name])
+
+            self.cli_commit()
+
+            # check that interface belongs to proper VRF
+            for interface in self._interfaces:
+                tmp = get_interface_vrf(interface)
+                self.assertEqual(tmp, vrf2_name)
+
+                tmp = get_interface_config(vrf2_name)
+                self.assertEqual(int(vrf2_table), get_vrf_tableid(interface))
+
+            self.cli_delete(['vrf', 'name', vrf1_name])
+            self.cli_delete(['vrf', 'name', vrf2_name])
+
+        def test_add_to_invalid_vrf(self):
+            if not self._test_vrf:
+                self.skipTest('not supported')
+
+            # move interface into first VRF
+            for interface in self._interfaces:
+                for option in self._options.get(interface, []):
+                    self.cli_set(self._base_path + [interface] + option.split())
+                self.cli_set(self._base_path + [interface, 'vrf', 'invalid'])
+
+            # check validate() - can not use a non-existing VRF
+            with self.assertRaises(ConfigSessionError):
+                self.cli_commit()
+
+            for interface in self._interfaces:
+                self.cli_delete(self._base_path + [interface, 'vrf', 'invalid'])
+                self.cli_set(self._base_path + [interface, 'description', 'test_add_to_invalid_vrf'])
 
         def test_span_mirror(self):
             if not self._mirror_interfaces:
@@ -1090,3 +1239,86 @@ class BasicInterfaceTest:
                 # as until commit() is called, nothing happens
                 section = Section.section(delegatee)
                 self.cli_delete(['interfaces', section, delegatee])
+
+        def test_eapol(self):
+            if not self._test_eapol:
+                self.skipTest('not supported')
+
+            cfg_dir = '/run/wpa_supplicant'
+
+            ca_certs = {
+                'eapol-server-ca-root': server_ca_root_cert_data,
+                'eapol-server-ca-intermediate': server_ca_intermediate_cert_data,
+                'eapol-client-ca-root': client_ca_root_cert_data,
+                'eapol-client-ca-intermediate': client_ca_intermediate_cert_data,
+            }
+            cert_name = 'eapol-client'
+
+            for name, data in ca_certs.items():
+                self.cli_set(['pki', 'ca', name, 'certificate', data.replace('\n','')])
+
+            self.cli_set(['pki', 'certificate', cert_name, 'certificate', client_cert_data.replace('\n','')])
+            self.cli_set(['pki', 'certificate', cert_name, 'private', 'key', client_key_data.replace('\n','')])
+
+            for interface in self._interfaces:
+                path = self._base_path + [interface]
+                for option in self._options.get(interface, []):
+                    self.cli_set(path + option.split())
+
+                # Enable EAPoL
+                self.cli_set(self._base_path + [interface, 'eapol', 'ca-certificate', 'eapol-server-ca-intermediate'])
+                self.cli_set(self._base_path + [interface, 'eapol', 'ca-certificate', 'eapol-client-ca-intermediate'])
+                self.cli_set(self._base_path + [interface, 'eapol', 'certificate', cert_name])
+
+            self.cli_commit()
+
+            # Test multiple CA chains
+            self.assertEqual(get_certificate_count(interface, 'ca'), 4)
+
+            for interface in self._interfaces:
+                self.cli_delete(self._base_path + [interface, 'eapol', 'ca-certificate', 'eapol-client-ca-intermediate'])
+
+            self.cli_commit()
+
+            # Validate interface config
+            for interface in self._interfaces:
+                tmp = get_wpa_supplicant_value(interface, 'key_mgmt')
+                self.assertEqual('IEEE8021X', tmp)
+
+                tmp = get_wpa_supplicant_value(interface, 'eap')
+                self.assertEqual('TLS', tmp)
+
+                tmp = get_wpa_supplicant_value(interface, 'eapol_flags')
+                self.assertEqual('0', tmp)
+
+                tmp = get_wpa_supplicant_value(interface, 'ca_cert')
+                self.assertEqual(f'"{cfg_dir}/{interface}_ca.pem"', tmp)
+
+                tmp = get_wpa_supplicant_value(interface, 'client_cert')
+                self.assertEqual(f'"{cfg_dir}/{interface}_cert.pem"', tmp)
+
+                tmp = get_wpa_supplicant_value(interface, 'private_key')
+                self.assertEqual(f'"{cfg_dir}/{interface}_cert.key"', tmp)
+
+                mac = read_file(f'/sys/class/net/{interface}/address')
+                tmp = get_wpa_supplicant_value(interface, 'identity')
+                self.assertEqual(f'"{mac}"', tmp)
+
+                # Check certificate files have the full chain
+                self.assertEqual(get_certificate_count(interface, 'ca'), 2)
+                self.assertEqual(get_certificate_count(interface, 'cert'), 3)
+
+                # Check for running process
+                self.assertTrue(process_named_running('wpa_supplicant', cmdline=f'-i{interface}'))
+
+            # Remove EAPoL configuration
+            for interface in self._interfaces:
+                self.cli_delete(self._base_path + [interface, 'eapol'])
+
+            # Commit and check that process is no longer running
+            self.cli_commit()
+            self.assertFalse(process_named_running('wpa_supplicant'))
+
+            for name in ca_certs:
+                self.cli_delete(['pki', 'ca', name])
+            self.cli_delete(['pki', 'certificate', cert_name])

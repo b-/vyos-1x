@@ -21,6 +21,7 @@ from base_vyostest_shim import VyOSUnitTestSHIM
 
 from vyos.utils.file import read_file
 from vyos.utils.process import process_named_running
+from vyos.xml_ref import default_value
 
 PROCESS_NAME = 'rsyslogd'
 RSYSLOG_CONF = '/etc/rsyslog.d/00-vyos.conf'
@@ -53,27 +54,78 @@ class TestRSYSLOGService(VyOSUnitTestSHIM.TestCase):
         self.assertFalse(process_named_running(PROCESS_NAME))
 
     def test_syslog_basic(self):
-        host1 = '198.51.100.1'
-        host2 = '192.0.2.1'
+        host1 = '127.0.0.10'
+        host2 = '127.0.0.20'
 
         self.cli_set(base_path + ['host', host1, 'port', '999'])
         self.cli_set(base_path + ['host', host1, 'facility', 'all', 'level', 'all'])
         self.cli_set(base_path + ['host', host2, 'facility', 'kern', 'level', 'err'])
         self.cli_set(base_path + ['console', 'facility', 'all', 'level', 'warning'])
 
-
         self.cli_commit()
         # verify log level and facilities in config file
         # *.warning /dev/console
         # *.* @198.51.100.1:999
         # kern.err @192.0.2.1:514
-        config = [get_config_value('\*.\*'), get_config_value('kern.err'), get_config_value('\*.warning')]
-        expected = ['@198.51.100.1:999', '@192.0.2.1:514', '/dev/console']
+        config = [
+            get_config_value('\*.\*'),
+            get_config_value('kern.err'),
+            get_config_value('\*.warning'),
+        ]
+        expected = [f'@{host1}:999', f'@{host2}:514', '/dev/console']
 
-        for i in range(0,3):
+        for i in range(0, 3):
             self.assertIn(expected[i], config[i])
         # Check for running process
         self.assertTrue(process_named_running(PROCESS_NAME))
+
+    def test_syslog_global(self):
+        hostname = 'vyos123'
+        domainname = 'example.local'
+        self.cli_set(['system', 'host-name', hostname])
+        self.cli_set(['system', 'domain-name', domainname])
+        self.cli_set(base_path + ['global', 'marker', 'interval', '600'])
+        self.cli_set(base_path + ['global', 'preserve-fqdn'])
+        self.cli_set(base_path + ['global', 'facility', 'kern', 'level', 'err'])
+
+        self.cli_commit()
+
+        config = read_file(RSYSLOG_CONF)
+        expected = [
+            '$MarkMessagePeriod 600',
+            '$PreserveFQDN on',
+            'kern.err',
+            f'$LocalHostName {hostname}.{domainname}',
+        ]
+
+        for e in expected:
+            self.assertIn(e, config)
+        # Check for running process
+        self.assertTrue(process_named_running(PROCESS_NAME))
+
+    def test_syslog_remote(self):
+        rhost = '169.254.0.1'
+        default_port = default_value(base_path + ['host', rhost, 'port'])
+
+        self.cli_set(base_path + ['global', 'facility', 'all', 'level', 'info'])
+        self.cli_set(base_path + ['global', 'facility', 'local7', 'level', 'debug'])
+        self.cli_set(base_path + ['host', rhost, 'facility', 'all', 'level', 'all'])
+        self.cli_set(base_path + ['host', rhost, 'protocol', 'tcp'])
+
+        self.cli_commit()
+
+        config = read_file(RSYSLOG_CONF)
+        self.assertIn(f'*.* @@{rhost}:{default_port}', config)
+
+        # Change default port and enable "octet-counting" mode
+        port = '10514'
+        self.cli_set(base_path + ['host', rhost, 'port', port])
+        self.cli_set(base_path + ['host', rhost, 'format', 'octet-counted'])
+        self.cli_commit()
+
+        config = read_file(RSYSLOG_CONF)
+        self.assertIn(f'*.* @@(o){rhost}:{port}', config)
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

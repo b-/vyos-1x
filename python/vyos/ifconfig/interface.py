@@ -1,4 +1,4 @@
-# Copyright 2019-2024 VyOS maintainers and contributors <maintainers@vyos.io>
+# Copyright 2019-2025 VyOS maintainers and contributors <maintainers@vyos.io>
 #
 # This library is free software; you can redistribute it and/or
 # modify it under the terms of the GNU Lesser General Public
@@ -26,23 +26,31 @@ from netifaces import ifaddresses
 # this is not the same as socket.AF_INET/INET6
 from netifaces import AF_INET
 from netifaces import AF_INET6
+from netaddr import EUI
+from netaddr import mac_unix_expanded
 
-from vyos import ConfigError
 from vyos.configdict import list_diff
 from vyos.configdict import dict_merge
 from vyos.configdict import get_vlan_ids
 from vyos.defaults import directories
+from vyos.pki import find_chain
+from vyos.pki import encode_certificate
+from vyos.pki import load_certificate
+from vyos.pki import wrap_private_key
+from vyos.template import is_ipv4
+from vyos.template import is_ipv6
 from vyos.template import render
 from vyos.utils.network import mac2eui64
 from vyos.utils.dict import dict_search
 from vyos.utils.network import get_interface_config
+from vyos.utils.network import get_interface_address
 from vyos.utils.network import get_interface_namespace
+from vyos.utils.network import get_vrf_tableid
 from vyos.utils.network import is_netns_interface
 from vyos.utils.process import is_systemd_service_active
 from vyos.utils.process import run
-from vyos.template import is_ipv4
-from vyos.template import is_ipv6
 from vyos.utils.file import read_file
+from vyos.utils.file import write_file
 from vyos.utils.network import is_intf_addr_assigned
 from vyos.utils.network import is_ipv6_link_local
 from vyos.utils.assertion import assert_boolean
@@ -51,14 +59,10 @@ from vyos.utils.assertion import assert_mac
 from vyos.utils.assertion import assert_mtu
 from vyos.utils.assertion import assert_positive
 from vyos.utils.assertion import assert_range
-
 from vyos.ifconfig.control import Control
 from vyos.ifconfig.vrrp import VRRP
 from vyos.ifconfig.operational import Operational
 from vyos.ifconfig import Section
-
-from netaddr import EUI
-from netaddr import mac_unix_expanded
 
 link_local_prefix = 'fe80::/64'
 
@@ -69,7 +73,6 @@ class Interface(Control):
     OperationalClass = Operational
 
     options = ['debug', 'create']
-    required = []
     default = {
         'debug': True,
         'create': True,
@@ -92,6 +95,10 @@ class Interface(Control):
         'alias': {
             'shellcmd': 'ip -json -detail link list dev {ifname}',
             'format': lambda j: jmespath.search('[*].ifalias | [0]', json.loads(j)) or '',
+        },
+        'ifindex': {
+            'shellcmd': 'ip -json -detail link list dev {ifname}',
+            'format': lambda j: jmespath.search('[*].ifindex | [0]', json.loads(j)) or '',
         },
         'mac': {
             'shellcmd': 'ip -json -detail link list dev {ifname}',
@@ -327,22 +334,10 @@ class Interface(Control):
         super().__init__(**kargs)
 
         if not self.exists(ifname):
-            # Any instance of Interface, such as Interface('eth0') can be used
-            # safely to access the generic function in this class as 'type' is
-            # unset, the class can not be created
-            if not self.iftype:
-                raise Exception(f'interface "{ifname}" not found')
-            self.config['type'] = self.iftype
-
             # Should an Instance of a child class (EthernetIf, DummyIf, ..)
             # be required, then create should be set to False to not accidentally create it.
             # In case a subclass does not define it, we use get to set the default to True
-            if self.config.get('create',True):
-                for k in self.required:
-                    if k not in kargs:
-                        name = self.default['type']
-                        raise ConfigError(f'missing required option {k} for {name} {ifname} creation')
-
+            if self.config.get('create', True):
                 self._create()
             # If we can not connect to the interface then let the caller know
             # as the class could not be correctly initialised
@@ -355,13 +350,14 @@ class Interface(Control):
         self.operational = self.OperationalClass(ifname)
         self.vrrp = VRRP(ifname)
 
-    def _create(self):
+    def _create(self, type: str=''):
         # Do not create interface that already exist or exists in netns
         netns = self.config.get('netns', None)
         if self.exists(f'{self.ifname}', netns=netns):
             return
 
-        cmd = 'ip link add dev {ifname} type {type}'.format(**self.config)
+        cmd = f'ip link add dev {self.ifname}'
+        if type: cmd += f' type {type}'
         if 'netns' in self.config: cmd = f'ip netns exec {netns} {cmd}'
         self._cmd(cmd)
 
@@ -376,11 +372,17 @@ class Interface(Control):
         >>> i = Interface('eth0')
         >>> i.remove()
         """
+        # Stop WPA supplicant if EAPoL was in use
+        if is_systemd_service_active(f'wpa_supplicant-wired@{self.ifname}'):
+            self._cmd(f'systemctl stop wpa_supplicant-wired@{self.ifname}')
 
         # remove all assigned IP addresses from interface - this is a bit redundant
         # as the kernel will remove all addresses on interface deletion, but we
         # can not delete ALL interfaces, see below
         self.flush_addrs()
+
+        # remove interface from conntrack VRF interface map
+        self._del_interface_from_ct_iface_map()
 
         # ---------------------------------------------------------------------
         # Any class can define an eternal regex in its definition
@@ -402,29 +404,31 @@ class Interface(Control):
         if netns: cmd = f'ip netns exec {netns} {cmd}'
         return self._cmd(cmd)
 
-    def _set_vrf_ct_zone(self, vrf):
-        """
-        Add/Remove rules in nftables to associate traffic in VRF to an
-        individual conntack zone
-        """
-        # Don't allow for netns yet
-        if 'netns' in self.config:
-            return None
+    def _nft_check_and_run(self, nft_command):
+        # Check if deleting is possible first to avoid raising errors
+        _, err = self._popen(f'nft --check {nft_command}')
+        if not err:
+            # Remove map element
+            self._cmd(f'nft {nft_command}')
 
-        if vrf:
-            # Get routing table ID for VRF
-            vrf_table_id = get_interface_config(vrf).get('linkinfo', {}).get(
-                'info_data', {}).get('table')
-            # Add map element with interface and zone ID
-            if vrf_table_id:
-                self._cmd(f'nft add element inet vrf_zones ct_iface_map {{ "{self.ifname}" : {vrf_table_id} }}')
-        else:
-            nft_del_element = f'delete element inet vrf_zones ct_iface_map {{ "{self.ifname}" }}'
-            # Check if deleting is possible first to avoid raising errors
-            _, err = self._popen(f'nft --check {nft_del_element}')
-            if not err:
-                # Remove map element
-                self._cmd(f'nft {nft_del_element}')
+    def _del_interface_from_ct_iface_map(self):
+        nft_command = f'delete element inet vrf_zones ct_iface_map {{ "{self.ifname}" }}'
+        self._nft_check_and_run(nft_command)
+
+    def _add_interface_to_ct_iface_map(self, vrf_table_id: int):
+        nft_command = f'add element inet vrf_zones ct_iface_map {{ "{self.ifname}" : {vrf_table_id} }}'
+        self._nft_check_and_run(nft_command)
+
+    def get_ifindex(self):
+        """
+        Get interface index by name
+
+        Example:
+        >>> from vyos.ifconfig import Interface
+        >>> Interface('eth0').get_ifindex()
+        '2'
+        """
+        return int(self.get_interface('ifindex'))
 
     def get_min_mtu(self):
         """
@@ -597,12 +601,30 @@ class Interface(Control):
         >>> Interface('eth0').set_vrf()
         """
 
+        # Don't allow for netns yet
+        if 'netns' in self.config:
+            return False
+
         tmp = self.get_interface('vrf')
         if tmp == vrf:
             return False
 
+        # Get current VRF table ID
+        old_vrf_tableid = get_vrf_tableid(self.ifname)
         self.set_interface('vrf', vrf)
-        self._set_vrf_ct_zone(vrf)
+
+        if vrf:
+            # Get routing table ID number for VRF
+            vrf_table_id = get_vrf_tableid(vrf)
+            # Add map element with interface and zone ID
+            if vrf_table_id:
+                # delete old table ID from nftables if it has changed, e.g. interface moved to a different VRF
+                if old_vrf_tableid and old_vrf_tableid != int(vrf_table_id):
+                    self._del_interface_from_ct_iface_map()
+                self._add_interface_to_ct_iface_map(vrf_table_id)
+        else:
+            self._del_interface_from_ct_iface_map()
+
         return True
 
     def set_arp_cache_tmo(self, tmo):
@@ -1341,12 +1363,11 @@ class Interface(Control):
         if enable not in [True, False]:
             raise ValueError()
 
-        ifname = self.ifname
         config_base = directories['isc_dhclient_dir'] + '/dhclient'
-        dhclient_config_file = f'{config_base}_{ifname}.conf'
-        dhclient_lease_file = f'{config_base}_{ifname}.leases'
-        systemd_override_file = f'/run/systemd/system/dhclient@{ifname}.service.d/10-override.conf'
-        systemd_service = f'dhclient@{ifname}.service'
+        dhclient_config_file = f'{config_base}_{self.ifname}.conf'
+        dhclient_lease_file = f'{config_base}_{self.ifname}.leases'
+        systemd_override_file = f'/run/systemd/system/dhclient@{self.ifname}.service.d/10-override.conf'
+        systemd_service = f'dhclient@{self.ifname}.service'
 
         # Rendered client configuration files require the apsolute config path
         self.config['isc_dhclient_dir'] = directories['isc_dhclient_dir']
@@ -1380,6 +1401,21 @@ class Interface(Control):
         else:
             if is_systemd_service_active(systemd_service):
                 self._cmd(f'systemctl stop {systemd_service}')
+
+            # Smoketests occationally fail if the lease is not removed from the Kernel fast enough:
+            # AssertionError: 2 unexpectedly found in {17: [{'addr': '52:54:00:00:00:00',
+            # 'broadcast': 'ff:ff:ff:ff:ff:ff'}], 2: [{'addr': '192.0.2.103', 'netmask': '255.255.255.0',
+            #
+            # We will force removal of any dynamic IPv4 address from the interface
+            tmp = get_interface_address(self.ifname)
+            if tmp and 'addr_info' in tmp:
+                for address_dict in tmp['addr_info']:
+                    # Only remove dynamic assigned addresses
+                    if address_dict['family'] == 'inet' and 'dynamic' in address_dict:
+                        address = address_dict['local']
+                        prefixlen = address_dict['prefixlen']
+                        self.del_addr(f'{address}/{prefixlen}')
+
             # cleanup old config files
             for file in [dhclient_config_file, systemd_override_file, dhclient_lease_file]:
                 if os.path.isfile(file):
@@ -1509,6 +1545,61 @@ class Interface(Control):
             return None
         self.set_interface('per_client_thread', enable)
 
+    def set_eapol(self) -> None:
+        """ Take care about EAPoL supplicant daemon """
+
+        # XXX: wpa_supplicant works on the source interface
+        cfg_dir = '/run/wpa_supplicant'
+        wpa_supplicant_conf = f'{cfg_dir}/{self.ifname}.conf'
+        eapol_action='stop'
+
+        if 'eapol' in self.config:
+            # The default is a fallback to hw_id which is not present for any interface
+            # other then an ethernet interface. Thus we emulate hw_id by reading back the
+            # Kernel assigned MAC address
+            if 'hw_id' not in self.config:
+                self.config['hw_id'] = read_file(f'/sys/class/net/{self.ifname}/address')
+            render(wpa_supplicant_conf, 'ethernet/wpa_supplicant.conf.j2', self.config)
+
+            cert_file_path = os.path.join(cfg_dir, f'{self.ifname}_cert.pem')
+            cert_key_path = os.path.join(cfg_dir, f'{self.ifname}_cert.key')
+
+            cert_name = self.config['eapol']['certificate']
+            pki_cert = self.config['pki']['certificate'][cert_name]
+
+            loaded_pki_cert = load_certificate(pki_cert['certificate'])
+            loaded_ca_certs = {load_certificate(c['certificate'])
+                for c in self.config['pki']['ca'].values()} if 'ca' in self.config['pki'] else {}
+
+            cert_full_chain = find_chain(loaded_pki_cert, loaded_ca_certs)
+
+            write_file(cert_file_path,
+                    '\n'.join(encode_certificate(c) for c in cert_full_chain))
+            write_file(cert_key_path, wrap_private_key(pki_cert['private']['key']))
+
+            if 'ca_certificate' in self.config['eapol']:
+                ca_cert_file_path = os.path.join(cfg_dir, f'{self.ifname}_ca.pem')
+                ca_chains = []
+
+                for ca_cert_name in self.config['eapol']['ca_certificate']:
+                    pki_ca_cert = self.config['pki']['ca'][ca_cert_name]
+                    loaded_ca_cert = load_certificate(pki_ca_cert['certificate'])
+                    ca_full_chain = find_chain(loaded_ca_cert, loaded_ca_certs)
+                    ca_chains.append(
+                        '\n'.join(encode_certificate(c) for c in ca_full_chain))
+
+                write_file(ca_cert_file_path, '\n'.join(ca_chains))
+
+            eapol_action='reload-or-restart'
+
+        # start/stop WPA supplicant service
+        self._cmd(f'systemctl {eapol_action} wpa_supplicant-wired@{self.ifname}')
+
+        if 'eapol' not in self.config:
+            # delete configuration on interface removal
+            if os.path.isfile(wpa_supplicant_conf):
+                os.unlink(wpa_supplicant_conf)
+
     def update(self, config):
         """ General helper function which works on a dictionary retrived by
         get_config_dict(). It's main intention is to consolidate the scattered
@@ -1596,7 +1687,6 @@ class Interface(Control):
             tmp = get_interface_config(config['ifname'])
             if 'master' in tmp and tmp['master'] != bridge_if:
                 self.set_vrf('')
-
         else:
             self.set_vrf(config.get('vrf', ''))
 
@@ -1849,8 +1939,6 @@ class Interface(Control):
 
 class VLANIf(Interface):
     """ Specific class which abstracts 802.1q and 802.1ad (Q-in-Q) VLAN interfaces """
-    iftype = 'vlan'
-
     def _create(self):
         # bail out early if interface already exists
         if self.exists(f'{self.ifname}'):

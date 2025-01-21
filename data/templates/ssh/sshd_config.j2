@@ -67,6 +67,11 @@ Ciphers {{ ciphers | join(',') }}
 HostKeyAlgorithms {{ hostkey_algorithm | join(',') }}
 {% endif %}
 
+{% if pubkey_accepted_algorithm is vyos_defined %}
+# Specifies the available PubKey signature algorithms
+PubkeyAcceptedAlgorithms {{ pubkey_accepted_algorithm | join(',') }}
+{% endif %}
+
 {% if mac is vyos_defined %}
 # Specifies the available MAC (message authentication code) algorithms
 MACs {{ mac | join(',') }}
@@ -104,4 +109,8 @@ ClientAliveInterval {{ client_keepalive_interval }}
 
 {% if rekey.data is vyos_defined  %}
 RekeyLimit {{ rekey.data }}M {{ rekey.time + 'M' if rekey.time is vyos_defined }}
+{% endif %}
+
+{% if trusted_user_ca_key is vyos_defined %}
+TrustedUserCAKeys /etc/ssh/trusted_user_ca_key
 {% endif %}

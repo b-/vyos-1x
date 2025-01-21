@@ -31,31 +31,20 @@ from vyos.configverify import verify_mtu_ipv6
 from vyos.configverify import verify_vlan_config
 from vyos.configverify import verify_vrf
 from vyos.configverify import verify_bond_bridge_member
-from vyos.configverify import verify_pki_certificate
-from vyos.configverify import verify_pki_ca_certificate
+from vyos.configverify import verify_eapol
 from vyos.ethtool import Ethtool
+from vyos.frrender import FRRender
+from vyos.frrender import get_frrender_dict
 from vyos.ifconfig import EthernetIf
 from vyos.ifconfig import BondIf
-from vyos.pki import find_chain
-from vyos.pki import encode_certificate
-from vyos.pki import load_certificate
-from vyos.pki import wrap_private_key
-from vyos.template import render
-from vyos.template import render_to_string
-from vyos.utils.process import call
 from vyos.utils.dict import dict_search
 from vyos.utils.dict import dict_to_paths_values
 from vyos.utils.dict import dict_set
 from vyos.utils.dict import dict_delete
-from vyos.utils.file import write_file
+from vyos.utils.process import is_systemd_service_running
 from vyos import ConfigError
-from vyos import frr
 from vyos import airbag
 airbag.enable()
-
-# XXX: wpa_supplicant works on the source interface
-cfg_dir = '/run/wpa_supplicant'
-wpa_suppl_conf = '/run/wpa_supplicant/{ifname}.conf'
 
 def update_bond_options(conf: Config, eth_conf: dict) -> list:
     """
@@ -176,6 +165,9 @@ def get_config(config=None):
     tmp = is_node_changed(conf, base + [ifname, 'duplex'])
     if tmp: ethernet.update({'speed_duplex_changed': {}})
 
+    tmp = is_node_changed(conf, base + [ifname, 'evpn'])
+    if tmp: ethernet.update({'frr_dict' : get_frrender_dict(conf)})
+
     return ethernet
 
 def verify_speed_duplex(ethernet: dict, ethtool: Ethtool):
@@ -277,23 +269,6 @@ def verify_allowedbond_changes(ethernet: dict):
                               f' on interface "{ethernet["ifname"]}".' \
                               f' Interface is a bond member')
 
-def verify_eapol(ethernet: dict):
-    """
-    Common helper function used by interface implementations to perform
-    recurring validation of EAPoL configuration.
-    """
-    if 'eapol' not in ethernet:
-        return
-
-    if 'certificate' not in ethernet['eapol']:
-        raise ConfigError('Certificate must be specified when using EAPoL!')
-
-    verify_pki_certificate(ethernet, ethernet['eapol']['certificate'], no_password_protected=True)
-
-    if 'ca_certificate' in ethernet['eapol']:
-        for ca_cert in ethernet['eapol']['ca_certificate']:
-            verify_pki_ca_certificate(ethernet, ca_cert)
-
 def verify(ethernet):
     if 'deleted' in ethernet:
         return None
@@ -310,7 +285,7 @@ def verify_bond_member(ethernet):
     :type ethernet: dict
     """
     ifname = ethernet['ifname']
-    verify_interface_exists(ifname)
+    verify_interface_exists(ethernet, ifname)
     verify_eapol(ethernet)
     verify_mirror_redirect(ethernet)
     ethtool = Ethtool(ifname)
@@ -327,7 +302,7 @@ def verify_ethernet(ethernet):
     :type ethernet: dict
     """
     ifname = ethernet['ifname']
-    verify_interface_exists(ifname)
+    verify_interface_exists(ethernet, ifname)
     verify_mtu(ethernet)
     verify_mtu_ipv6(ethernet)
     verify_dhcpv6(ethernet)
@@ -346,90 +321,26 @@ def verify_ethernet(ethernet):
     verify_vlan_config(ethernet)
     return None
 
-
 def generate(ethernet):
-    # render real configuration file once
-    wpa_supplicant_conf = wpa_suppl_conf.format(**ethernet)
-
-    if 'deleted' in ethernet:
-        # delete configuration on interface removal
-        if os.path.isfile(wpa_supplicant_conf):
-            os.unlink(wpa_supplicant_conf)
-        return None
-
-    if 'eapol' in ethernet:
-        ifname = ethernet['ifname']
-
-        render(wpa_supplicant_conf, 'ethernet/wpa_supplicant.conf.j2', ethernet)
-
-        cert_file_path = os.path.join(cfg_dir, f'{ifname}_cert.pem')
-        cert_key_path = os.path.join(cfg_dir, f'{ifname}_cert.key')
-
-        cert_name = ethernet['eapol']['certificate']
-        pki_cert = ethernet['pki']['certificate'][cert_name]
-
-        loaded_pki_cert = load_certificate(pki_cert['certificate'])
-        loaded_ca_certs = {load_certificate(c['certificate'])
-            for c in ethernet['pki']['ca'].values()} if 'ca' in ethernet['pki'] else {}
-
-        cert_full_chain = find_chain(loaded_pki_cert, loaded_ca_certs)
-
-        write_file(cert_file_path,
-                   '\n'.join(encode_certificate(c) for c in cert_full_chain))
-        write_file(cert_key_path, wrap_private_key(pki_cert['private']['key']))
-
-        if 'ca_certificate' in ethernet['eapol']:
-            ca_cert_file_path = os.path.join(cfg_dir, f'{ifname}_ca.pem')
-            ca_chains = []
-
-            for ca_cert_name in ethernet['eapol']['ca_certificate']:
-                pki_ca_cert = ethernet['pki']['ca'][ca_cert_name]
-                loaded_ca_cert = load_certificate(pki_ca_cert['certificate'])
-                ca_full_chain = find_chain(loaded_ca_cert, loaded_ca_certs)
-                ca_chains.append(
-                    '\n'.join(encode_certificate(c) for c in ca_full_chain))
-
-            write_file(ca_cert_file_path, '\n'.join(ca_chains))
-
-    ethernet['frr_zebra_config'] = ''
-    if 'deleted' not in ethernet:
-        ethernet['frr_zebra_config'] = render_to_string('frr/evpn.mh.frr.j2', ethernet)
-
+    if 'frr_dict' in ethernet and not is_systemd_service_running('vyos-configd.service'):
+        FRRender().generate(ethernet['frr_dict'])
     return None
 
 def apply(ethernet):
-    ifname = ethernet['ifname']
-    # take care about EAPoL supplicant daemon
-    eapol_action='stop'
-
-    e = EthernetIf(ifname)
+    if 'frr_dict' in ethernet and not is_systemd_service_running('vyos-configd.service'):
+        FRRender().apply()
+    e = EthernetIf(ethernet['ifname'])
     if 'deleted' in ethernet:
-        # delete interface
         e.remove()
     else:
         e.update(ethernet)
-        if 'eapol' in ethernet:
-            eapol_action='reload-or-restart'
-
-    call(f'systemctl {eapol_action} wpa_supplicant-wired@{ifname}')
-
-    zebra_daemon = 'zebra'
-    # Save original configuration prior to starting any commit actions
-    frr_cfg = frr.FRRConfig()
-
-    # The route-map used for the FIB (zebra) is part of the zebra daemon
-    frr_cfg.load_configuration(zebra_daemon)
-    frr_cfg.modify_section(f'^interface {ifname}', stop_pattern='^exit', remove_stop_mark=True)
-    if 'frr_zebra_config' in ethernet:
-        frr_cfg.add_before(frr.default_add_before, ethernet['frr_zebra_config'])
-    frr_cfg.commit_configuration(zebra_daemon)
+    return None
 
 if __name__ == '__main__':
     try:
         c = get_config()
         verify(c)
         generate(c)
-
         apply(c)
     except ConfigError as e:
         print(e)

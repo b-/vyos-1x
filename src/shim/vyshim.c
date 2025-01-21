@@ -67,6 +67,8 @@ void timer_handler(int);
 
 double get_posix_clock_time(void);
 
+static char * s_recv_string (void *, int);
+
 int main(int argc, char* argv[])
 {
     // string for node data: conf_mode script and tagnode, if applicable
@@ -117,33 +119,42 @@ int main(int argc, char* argv[])
 
     zmq_send(requester, string_node_data_msg, strlen(string_node_data_msg), 0);
     zmq_recv(requester, error_code, 1, 0);
-    debug_print("Received node data receipt\n");
+    debug_print("Received node data receipt with error_code\n");
 
-    int err = (int)error_code[0];
+    char msg_size_str[7];
+    zmq_recv(requester, msg_size_str, 6, 0);
+    msg_size_str[6] = '\0';
+    int msg_size = (int)strtol(msg_size_str, NULL, 16);
+    debug_print("msg_size: %d\n", msg_size);
+
+    char *msg = s_recv_string(requester, msg_size);
+    printf("%s", msg);
+    free(msg);
 
     free(string_node_data_msg);
 
-    zmq_close(requester);
-    zmq_ctx_destroy(context);
+    int err = (int)error_code[0];
+    int ret = 0;
 
     if (err & PASS) {
         debug_print("Received PASS\n");
-        int ret = pass_through(argv, ex_index);
-        return ret;
+        ret = pass_through(argv, ex_index);
     }
 
     if (err & ERROR_DAEMON) {
         debug_print("Received ERROR_DAEMON\n");
-        int ret = pass_through(argv, ex_index);
-        return ret;
+        ret = pass_through(argv, ex_index);
     }
 
     if (err & ERROR_COMMIT) {
         debug_print("Received ERROR_COMMIT\n");
-        return -1;
+        ret = -1;
     }
 
-    return 0;
+    zmq_close(requester);
+    zmq_ctx_destroy(context);
+
+    return ret;
 }
 
 int initialization(void* Requester)
@@ -184,6 +195,20 @@ int initialization(void* Requester)
         sudo_user = nobody;
     }
     debug_print("sudo_user is %s\n", sudo_user);
+
+    char *temp_config_dir = getenv("VYATTA_TEMP_CONFIG_DIR");
+    if (!temp_config_dir) {
+        char none[] = "";
+        temp_config_dir = none;
+    }
+    debug_print("temp_config_dir is %s\n", temp_config_dir);
+
+    char *changes_only_dir = getenv("VYATTA_CHANGES_ONLY_DIR");
+    if (!changes_only_dir) {
+        char none[] = "";
+        changes_only_dir = none;
+    }
+    debug_print("changes_only_dir is %s\n", changes_only_dir);
 
     debug_print("Sending init announcement\n");
     char *init_announce = mkjson(MKJSON_OBJ, 1,
@@ -252,6 +277,16 @@ int initialization(void* Requester)
     zmq_recv(Requester, buffer, 16, 0);
     debug_print("Received sudo_user receipt\n");
 
+    debug_print("Sending config session temp_config_dir\n");
+    zmq_send(Requester, temp_config_dir, strlen(temp_config_dir), 0);
+    zmq_recv(Requester, buffer, 16, 0);
+    debug_print("Received temp_config_dir receipt\n");
+
+    debug_print("Sending config session changes_only_dir\n");
+    zmq_send(Requester, changes_only_dir, strlen(changes_only_dir), 0);
+    zmq_recv(Requester, buffer, 16, 0);
+    debug_print("Received changes_only_dir receipt\n");
+
     return 0;
 }
 
@@ -318,3 +353,15 @@ double get_posix_clock_time(void)
 double get_posix_clock_time(void)
 {return (double)0;}
 #endif
+
+//  Receive string from socket and convert into C string
+static char * s_recv_string (void *socket, int bufsize) {
+    char * buffer = (char *)malloc(bufsize+1);
+    int size = zmq_recv(socket, buffer, bufsize, 0);
+    if (size == -1)
+        return NULL;
+    if (size > bufsize)
+        size = bufsize;
+    buffer[size] = '\0';
+    return buffer;
+}

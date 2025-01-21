@@ -42,8 +42,6 @@ class VXLANIf(Interface):
     For more information please refer to:
     https://www.kernel.org/doc/Documentation/networking/vxlan.txt
     """
-
-    iftype = 'vxlan'
     definition = {
         **Interface.definition,
         **{
@@ -94,7 +92,7 @@ class VXLANIf(Interface):
             remote_list = self.config['remote'][1:]
             self.config['remote'] = self.config['remote'][0]
 
-        cmd = 'ip link add {ifname} type {type} dstport {port}'
+        cmd = 'ip link add {ifname} type vxlan dstport {port}'
         for vyos_key, iproute2_key in mapping.items():
             # dict_search will return an empty dict "{}" for valueless nodes like
             # "parameters.nolearning" - thus we need to test the nodes existence
@@ -134,6 +132,19 @@ class VXLANIf(Interface):
         Controls whether vlan to tunnel mapping is enabled on the port.
         By default this flag is off.
         """
+        def range_to_dict(vlan_to_vni):
+            """ Converts dict of ranges to dict """
+            result_dict = {}
+            for vlan, vlan_conf in vlan_to_vni.items():
+                vni = vlan_conf['vni']
+                vlan_range, vni_range = vlan.split('-'), vni.split('-')
+                if len(vlan_range) > 1:
+                    vlan_range = range(int(vlan_range[0]), int(vlan_range[1]) + 1)
+                    vni_range = range(int(vni_range[0]), int(vni_range[1]) + 1)
+                dict_to_add = {str(k): {'vni': str(v)} for k, v in zip(vlan_range, vni_range)}
+                result_dict.update(dict_to_add)
+            return result_dict
+
         if not isinstance(state, bool):
             raise ValueError('Value out of range')
 
@@ -142,7 +153,7 @@ class VXLANIf(Interface):
             if dict_search('parameters.vni_filter', self.config) != None:
                 cur_vni_filter = get_vxlan_vni_filter(self.ifname)
 
-            for vlan, vlan_config in self.config['vlan_to_vni_removed'].items():
+            for vlan, vlan_config in range_to_dict(self.config['vlan_to_vni_removed']).items():
                 # If VNI filtering is enabled, remove matching VNI filter
                 if cur_vni_filter != None:
                     vni = vlan_config['vni']
@@ -159,10 +170,11 @@ class VXLANIf(Interface):
 
         if 'vlan_to_vni' in self.config:
             # Determine current OS Kernel configured VLANs
+            vlan_vni_mapping = range_to_dict(self.config['vlan_to_vni'])
             os_configured_vlan_ids = get_vxlan_vlan_tunnels(self.ifname)
-            add_vlan = list_diff(list(self.config['vlan_to_vni'].keys()), os_configured_vlan_ids)
+            add_vlan = list_diff(list(vlan_vni_mapping.keys()), os_configured_vlan_ids)
 
-            for vlan, vlan_config in self.config['vlan_to_vni'].items():
+            for vlan, vlan_config in vlan_vni_mapping.items():
                 # VLAN mapping already exists - skip
                 if vlan not in add_vlan:
                     continue

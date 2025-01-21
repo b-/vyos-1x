@@ -63,7 +63,14 @@
               </completionHelp>
             </properties>
             <children>
+              <leafNode name="combined">
+                <properties>
+                  <help>Listen on both VLANs and the base interface</help>
+                  <valueless/>
+                </properties>
+              </leafNode>
               #include <include/accel-ppp/vlan.xml.i>
+              #include <include/accel-ppp/vlan-mon.xml.i>
             </children>
           </tagNode>
           <leafNode name="service-name">
@@ -74,6 +81,18 @@
               </constraint>
               <constraintErrorMessage>Service-name can contain aplhanumerical characters and dashes only (max. 100)</constraintErrorMessage>
               <multi/>
+            </properties>
+          </leafNode>
+          <leafNode name="accept-any-service">
+            <properties>
+              <help>Accept any service name in PPPoE Active Discovery Request (PADR)</help>
+              <valueless/>
+            </properties>
+          </leafNode>
+          <leafNode name="accept-blank-service">
+            <properties>
+              <help>Accept blank service name in PADR</help>
+              <valueless/>
             </properties>
           </leafNode>
           <tagNode name="pado-delay">

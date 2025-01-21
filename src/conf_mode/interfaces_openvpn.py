@@ -32,6 +32,7 @@ from vyos.base import DeprecationWarning
 from vyos.config import Config
 from vyos.configdict import get_interface_dict
 from vyos.configdict import is_node_changed
+from vyos.configdiff import get_config_diff
 from vyos.configverify import verify_vrf
 from vyos.configverify import verify_bridge_delete
 from vyos.configverify import verify_mirror_redirect
@@ -94,6 +95,23 @@ def get_config(config=None):
     if 'deleted' in openvpn:
         return openvpn
 
+    if not is_node_changed(conf, base) and dict_search_args(openvpn, 'tls'):
+        diff = get_config_diff(conf)
+        if diff.get_child_nodes_diff(['pki'], recursive=True).get('add') == ['ca', 'certificate']:
+            crl_path = os.path.join(cfg_dir, f'{ifname}_crl.pem')
+            if os.path.exists(crl_path):
+                # do not restart service when changed only CRL and crl file already exist
+                openvpn.update({'no_restart_crl': True})
+            for rec in diff.get_child_nodes_diff(['pki', 'ca'], recursive=True).get('add'):
+                if diff.get_child_nodes_diff(['pki', 'ca', rec], recursive=True).get('add') != ['crl']:
+                    openvpn.update({'no_restart_crl': False})
+                    break
+            if openvpn.get('no_restart_crl'):
+                for rec in diff.get_child_nodes_diff(['pki', 'certificate'], recursive=True).get('add'):
+                    if diff.get_child_nodes_diff(['pki', 'certificate', rec], recursive=True).get('add') != ['revoke']:
+                        openvpn.update({'no_restart_crl': False})
+                        break
+
     if is_node_changed(conf, base + [ifname, 'openvpn-option']):
         openvpn.update({'restart_required': {}})
     if is_node_changed(conf, base + [ifname, 'enable-dco']):
@@ -122,6 +140,18 @@ def get_config(config=None):
         if dict_search('offload.dco', interface_config) != None:
             openvpn['module_load_dco'] = {}
             break
+
+    # Calculate the protocol modifier. This is concatenated to the protocol string to direct
+    # OpenVPN to use a specific IP protocol version. If unspecified, the kernel decides which
+    # type of socket to open. In server mode, an additional "ipv6-dual-stack" option forces
+    # binding the socket in IPv6 mode, which can also receive IPv4 traffic (when using the
+    # default "ipv6" mode, we specify "bind ipv6only" to disable kernel dual-stack behaviors).
+    if openvpn['ip_version'] == 'ipv4':
+        openvpn['protocol_modifier'] = '4'
+    elif openvpn['ip_version'] in ['ipv6', 'dual-stack']:
+        openvpn['protocol_modifier']  = '6'
+    else:
+        openvpn['protocol_modifier'] = ''
 
     return openvpn
 
@@ -235,10 +265,6 @@ def verify_pki(openvpn):
 
 def verify(openvpn):
     if 'deleted' in openvpn:
-        # remove totp secrets file if totp is not configured
-        if os.path.isfile(otp_file.format(**openvpn)):
-            os.remove(otp_file.format(**openvpn))
-
         verify_bridge_delete(openvpn)
         return None
 
@@ -261,6 +287,9 @@ def verify(openvpn):
         if openvpn['protocol'] == 'tcp-passive':
             raise ConfigError('Protocol "tcp-passive" is not valid in client mode')
 
+        if 'ip_version' in openvpn and openvpn['ip_version'] == 'dual-stack':
+            raise ConfigError('"ip-version dual-stack" is not supported in client mode')
+
         if dict_search('tls.dh_params', openvpn):
             raise ConfigError('Cannot specify "tls dh-params" in client mode')
 
@@ -268,6 +297,9 @@ def verify(openvpn):
     # OpenVPN site-to-site - VERIFY
     #
     elif openvpn['mode'] == 'site-to-site':
+        if 'ip_version' in openvpn and openvpn['ip_version'] == 'dual-stack':
+            raise ConfigError('"ip-version dual-stack" is not supported in site-to-site mode')
+
         if 'local_address' not in openvpn and 'is_bridge_member' not in openvpn:
             raise ConfigError('Must specify "local-address" or add interface to bridge')
 
@@ -326,8 +358,8 @@ def verify(openvpn):
             if v4addr in openvpn['local_address'] and 'subnet_mask' not in openvpn['local_address'][v4addr]:
                 raise ConfigError('Must specify IPv4 "subnet-mask" for local-address')
 
-        if dict_search('encryption.ncp_ciphers', openvpn):
-            raise ConfigError('NCP ciphers can only be used in client or server mode')
+        if dict_search('encryption.data_ciphers', openvpn):
+            raise ConfigError('Cipher negotiation can only be used in client or server mode')
 
     else:
         # checks for client-server or site-to-site bridged
@@ -382,6 +414,22 @@ def verify(openvpn):
                 if (client_v.get('ip') and len(client_v['ip']) > 1) or (client_v.get('ipv6_ip') and len(client_v['ipv6_ip']) > 1):
                     raise ConfigError(f'Server client "{client_k}": cannot specify more than 1 IPv4 and 1 IPv6 IP')
 
+        if dict_search('server.bridge', openvpn):
+            # check if server bridge is a tap interfaces
+            if not openvpn['device_type'] == 'tap' and dict_search('server.bridge', openvpn):
+               raise ConfigError('Must specify "device-type tap" with server bridge mode')
+            elif not (dict_search('server.bridge.start', openvpn) and dict_search('server.bridge.stop', openvpn)):
+                raise ConfigError('Server bridge requires both start and stop addresses')
+            else:
+                v4PoolStart = IPv4Address(dict_search('server.bridge.start', openvpn))
+                v4PoolStop = IPv4Address(dict_search('server.bridge.stop', openvpn))
+                if v4PoolStart > v4PoolStop:
+                    raise ConfigError(f'Server bridge start address {v4PoolStart} is larger than stop address {v4PoolStop}')
+
+                v4PoolSize = int(v4PoolStop) - int(v4PoolStart)
+                if v4PoolSize >= 65536:
+                    raise ConfigError(f'Server bridge is too large [{v4PoolStart} -> {v4PoolStop} = {v4PoolSize}], maximum is 65536 addresses.')
+
         if dict_search('server.client_ip_pool', openvpn):
             if not (dict_search('server.client_ip_pool.start', openvpn) and dict_search('server.client_ip_pool.stop', openvpn)):
                 raise ConfigError('Server client-ip-pool requires both start and stop addresses')
@@ -432,6 +480,13 @@ def verify(openvpn):
                                 if IPv6Address(client['ipv6_ip'][0]) in v6PoolNet:
                                     print(f'Warning: Client "{client["name"]}" IP {client["ipv6_ip"][0]} is in server IP pool, it is not reserved for this client.')
 
+        if 'topology' in openvpn['server']:
+            if openvpn['server']['topology'] == 'net30':
+                DeprecationWarning('Topology net30 is deprecated '\
+                                   'and will be removed in future VyOS versions. '\
+                                   'Switch to "subnet" or "p2p"'
+                )
+
         # add mfa users to the file the mfa plugin uses
         if dict_search('server.mfa.totp', openvpn):
             user_data = ''
@@ -467,6 +522,25 @@ def verify(openvpn):
     # OpenVPN common verification section
     # not depending on any operation mode
     #
+
+    # verify that local_host/remote_host match with any ip_version override
+    # specified (if a dns name is specified for remote_host, no attempt is made
+    # to verify that record resolves to an address of the configured family)
+    if 'local_host' in openvpn:
+        if openvpn['ip_version'] == 'ipv4' and is_ipv6(openvpn['local_host']):
+            raise ConfigError('Cannot use an IPv6 "local-host" with "ip-version ipv4"')
+        elif openvpn['ip_version'] == 'ipv6' and is_ipv4(openvpn['local_host']):
+            raise ConfigError('Cannot use an IPv4 "local-host" with "ip-version ipv6"')
+        elif openvpn['ip_version'] == 'dual-stack':
+            raise ConfigError('Cannot use "local-host" with "ip-version dual-stack". "dual-stack" is only supported when OpenVPN binds to all available interfaces.')
+
+    if 'remote_host' in openvpn:
+        remote_hosts = dict_search('remote_host', openvpn)
+        for remote_host in remote_hosts:
+            if openvpn['ip_version'] == 'ipv4' and is_ipv6(remote_host):
+                raise ConfigError('Cannot use an IPv6 "remote-host" with "ip-version ipv4"')
+            elif openvpn['ip_version'] == 'ipv6' and is_ipv4(remote_host):
+                raise ConfigError('Cannot use an IPv4 "remote-host" with "ip-version ipv6"')
 
     # verify specified IP address is present on any interface on this system
     if 'local_host' in openvpn:
@@ -517,7 +591,7 @@ def verify(openvpn):
 
         if dict_search('encryption.cipher', openvpn):
             raise ConfigError('"encryption cipher" option is deprecated for TLS mode. '
-                              'Use "encryption ncp-ciphers" instead')
+                              'Use "encryption data-ciphers" instead')
 
     if dict_search('encryption.cipher', openvpn) == 'none':
         print('Warning: "encryption none" was specified!')
@@ -628,9 +702,19 @@ def generate_pki_files(openvpn):
 
 
 def generate(openvpn):
+    if 'deleted' in openvpn:
+        # remove totp secrets file if totp is not configured
+        if os.path.isfile(otp_file.format(**openvpn)):
+            os.remove(otp_file.format(**openvpn))
+        return None
+
+    if 'disable' in openvpn:
+        return None
+
     interface = openvpn['ifname']
     directory = os.path.dirname(cfg_file.format(**openvpn))
     openvpn['plugin_dir'] = '/usr/lib/openvpn'
+
     # create base config directory on demand
     makedir(directory, user, group)
     # enforce proper permissions on /run/openvpn
@@ -646,9 +730,6 @@ def generate(openvpn):
     service_dir = os.path.dirname(service_file.format(**openvpn))
     if os.path.isdir(service_dir):
         rmtree(service_dir, ignore_errors=True)
-
-    if 'deleted' in openvpn or 'disable' in openvpn:
-        return None
 
     # create client config directory on demand
     makedir(ccd_dir, user, group)
@@ -723,10 +804,12 @@ def apply(openvpn):
 
     # No matching OpenVPN process running - maybe it got killed or none
     # existed - nevertheless, spawn new OpenVPN process
-    action = 'reload-or-restart'
-    if 'restart_required' in openvpn:
-        action = 'restart'
-    call(f'systemctl {action} openvpn@{interface}.service')
+
+    if not openvpn.get('no_restart_crl'):
+        action = 'reload-or-restart'
+        if 'restart_required' in openvpn:
+            action = 'restart'
+        call(f'systemctl {action} openvpn@{interface}.service')
 
     o = VTunIf(**openvpn)
     o.update(openvpn)

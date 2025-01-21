@@ -31,7 +31,6 @@ class BondIf(Interface):
     monitoring may be performed.
     """
 
-    iftype = 'bond'
     definition = {
         **Interface.definition,
         ** {
@@ -108,6 +107,9 @@ class BondIf(Interface):
             'mtu'
         ]
         return options
+
+    def _create(self):
+        super()._create('bond')
 
     def remove(self):
         """
@@ -504,3 +506,6 @@ class BondIf(Interface):
 
         # call base class first
         super().update(config)
+
+        # enable/disable EAPoL (Extensible Authentication Protocol over Local Area Network)
+        self.set_eapol()

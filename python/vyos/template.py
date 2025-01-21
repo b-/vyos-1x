@@ -556,8 +556,8 @@ def get_openvpn_cipher(cipher):
         return openvpn_translate[cipher].upper()
     return cipher.upper()
 
-@register_filter('openvpn_ncp_ciphers')
-def get_openvpn_ncp_ciphers(ciphers):
+@register_filter('openvpn_data_ciphers')
+def get_openvpn_data_ciphers(ciphers):
     out = []
     for cipher in ciphers:
         if cipher in openvpn_translate:
@@ -694,7 +694,8 @@ def conntrack_rule(rule_conf, rule_id, action, ipv6=False):
         else:
             for protocol, protocol_config in rule_conf['protocol'].items():
                 proto = protocol
-        output.append(f'meta l4proto {proto}')
+        if proto != 'all':
+            output.append(f'meta l4proto {proto}')
 
     tcp_flags = dict_search_args(rule_conf, 'tcp', 'flags')
     if tcp_flags and action != 'timeout':
@@ -922,8 +923,8 @@ def kea6_shared_network_json(shared_networks):
             'subnet6': []
         }
 
-        if 'common_options' in config:
-            network['option-data'] = kea6_parse_options(config['common_options'])
+        if 'option' in config:
+            network['option-data'] = kea6_parse_options(config['option'])
 
         if 'interface' in config:
             network['interface'] = config['interface']

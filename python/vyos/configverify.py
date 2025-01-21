@@ -237,7 +237,7 @@ def verify_bridge_delete(config):
         raise ConfigError(f'Interface "{interface}" cannot be deleted as it '
                           f'is a member of bridge "{bridge_name}"!')
 
-def verify_interface_exists(ifname, warning_only=False):
+def verify_interface_exists(config, ifname, state_required=False, warning_only=False):
     """
     Common helper function used by interface implementations to perform
     recurring validation if an interface actually exists. We first probe
@@ -245,15 +245,14 @@ def verify_interface_exists(ifname, warning_only=False):
     it exists at the OS level.
     """
     from vyos.base import Warning
-    from vyos.configquery import ConfigTreeQuery
     from vyos.utils.dict import dict_search_recursive
     from vyos.utils.network import interface_exists
 
-    # Check if interface is present in CLI config
-    config = ConfigTreeQuery()
-    tmp = config.get_config_dict(['interfaces'], get_first_key=True)
-    if bool(list(dict_search_recursive(tmp, ifname))):
-        return True
+    if not state_required:
+        # Check if interface is present in CLI config
+        tmp = getattr(config, 'interfaces_root', {})
+        if bool(list(dict_search_recursive(tmp, ifname))):
+            return True
 
     # Interface not found on CLI, try Linux Kernel
     if interface_exists(ifname):
@@ -421,7 +420,7 @@ def verify_common_route_maps(config):
             continue
         tmp = config[route_map]
         # Check if the specified route-map exists, if not error out
-        if dict_search(f'policy.route-map.{tmp}', config) == None:
+        if dict_search(f'policy.route_map.{tmp}', config) == None:
             raise ConfigError(f'Specified route-map "{tmp}" does not exist!')
 
     if 'redistribute' in config:
@@ -435,7 +434,7 @@ def verify_route_map(route_map_name, config):
     recurring validation if a specified route-map exists!
     """
     # Check if the specified route-map exists, if not error out
-    if dict_search(f'policy.route-map.{route_map_name}', config) == None:
+    if dict_search(f'policy.route_map.{route_map_name}', config) == None:
         raise ConfigError(f'Specified route-map "{route_map_name}" does not exist!')
 
 def verify_prefix_list(prefix_list, config, version=''):
@@ -444,7 +443,7 @@ def verify_prefix_list(prefix_list, config, version=''):
     recurring validation if a specified prefix-list exists!
     """
     # Check if the specified prefix-list exists, if not error out
-    if dict_search(f'policy.prefix-list{version}.{prefix_list}', config) == None:
+    if dict_search(f'policy.prefix_list{version}.{prefix_list}', config) == None:
         raise ConfigError(f'Specified prefix-list{version} "{prefix_list}" does not exist!')
 
 def verify_access_list(access_list, config, version=''):
@@ -453,7 +452,7 @@ def verify_access_list(access_list, config, version=''):
     recurring validation if a specified prefix-list exists!
     """
     # Check if the specified ACL exists, if not error out
-    if dict_search(f'policy.access-list{version}.{access_list}', config) == None:
+    if dict_search(f'policy.access_list{version}.{access_list}', config) == None:
         raise ConfigError(f'Specified access-list{version} "{access_list}" does not exist!')
 
 def verify_pki_certificate(config: dict, cert_name: str, no_password_protected: bool=False):
@@ -521,3 +520,30 @@ def verify_pki_dh_parameters(config: dict, dh_name: str, min_key_size: int=0):
         dh_bits = dh_numbers.p.bit_length()
         if dh_bits < min_key_size:
             raise ConfigError(f'Minimum DH key-size is {min_key_size} bits!')
+
+def verify_eapol(config: dict):
+    """
+    Common helper function used by interface implementations to perform
+    recurring validation of EAPoL configuration.
+    """
+    if 'eapol' not in config:
+        return
+
+    if 'certificate' not in config['eapol']:
+        raise ConfigError('Certificate must be specified when using EAPoL!')
+
+    verify_pki_certificate(config, config['eapol']['certificate'], no_password_protected=True)
+
+    if 'ca_certificate' in config['eapol']:
+        for ca_cert in config['eapol']['ca_certificate']:
+            verify_pki_ca_certificate(config, ca_cert)
+
+def has_frr_protocol_in_dict(config_dict: dict, protocol: str) -> bool:
+    vrf = None
+    if config_dict and 'vrf_context' in config_dict:
+        vrf = config_dict['vrf_context']
+    if vrf and protocol in (dict_search(f'vrf.name.{vrf}.protocols', config_dict) or []):
+        return True
+    if config_dict and protocol in config_dict:
+        return True
+    return False

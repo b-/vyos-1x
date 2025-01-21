@@ -49,6 +49,26 @@
                   <valueless/>
                 </properties>
               </leafNode>
+              <leafNode name="amd-pstate-driver">
+                <properties>
+                  <help>Enables and configures pstate driver for AMD Ryzen and Epyc CPUs</help>
+                  <completionHelp>
+                    <list>active passive guided</list>
+                  </completionHelp>
+                  <valueHelp>
+                    <format>active</format>
+                    <description>The firmware controls performance states and the system governor has no effect</description>
+                  </valueHelp>
+                  <valueHelp>
+                    <format>passive</format>
+                    <description>Allow the system governor to manage performance states</description>
+                  </valueHelp>
+                  <valueHelp>
+                    <format>guided</format>
+                    <description>The firmware controls performance states guided by the system governor</description>
+                  </valueHelp>
+                </properties>
+              </leafNode>
               <node name="debug">
                 <properties>
                   <help>Dynamic debugging for kernel module</help>
@@ -68,7 +88,7 @@
              <properties>
                <help>System keyboard layout, type ISO2</help>
                <completionHelp>
-                 <list>us uk fr de es fi jp106 no dk se-latin1 dvorak</list>
+                 <list>us uk fr de es fi it jp106 no dk se-latin1 dvorak</list>
                </completionHelp>
                <valueHelp>
                  <format>us</format>
@@ -95,6 +115,10 @@
                  <description>Finland</description>
                </valueHelp>
                <valueHelp>
+                <format>it</format>
+                <description>Italy</description>
+              </valueHelp>
+               <valueHelp>
                  <format>jp106</format>
                  <description>Japan</description>
                </valueHelp>
@@ -115,7 +139,7 @@
                  <description>Dvorak</description>
                </valueHelp>
                <constraint>
-                <regex>(us|uk|fr|de|es|fi|jp106|no|dk|se-latin1|dvorak)</regex>
+                <regex>(us|uk|fr|de|es|fi|it|jp106|no|dk|se-latin1|dvorak)</regex>
               </constraint>
               <constraintErrorMessage>Invalid keyboard layout</constraintErrorMessage>
              </properties>
@@ -125,19 +149,32 @@
             <properties>
               <help>Tune system performance</help>
               <completionHelp>
-                <list>throughput latency</list>
+                <list>network-throughput network-latency power-save virtual-host virtual-guest</list>
               </completionHelp>
               <valueHelp>
-                <format>throughput</format>
+                <format>network-throughput</format>
                 <description>Tune for maximum network throughput</description>
               </valueHelp>
               <valueHelp>
-                <format>latency</format>
+                <format>network-latency</format>
                 <description>Tune for low network latency</description>
               </valueHelp>
+              <valueHelp>
+                <format>power-save</format>
+                <description>Tune for low power consumption</description>
+              </valueHelp>
+              <valueHelp>
+                <format>virtual-guest</format>
+                <description>Tune for running inside a virtual machine</description>
+              </valueHelp>
+              <valueHelp>
+                <format>virtual-host</format>
+                <description>Tune for running guest virtual machines</description>
+              </valueHelp>
               <constraint>
-                <regex>(throughput|latency)</regex>
+                <regex>(network-throughput|network-latency|power-save|virtual-guest|virtual-host)</regex>
               </constraint>
+              <multi/>
             </properties>
            </leafNode>
            <node name="http-client">

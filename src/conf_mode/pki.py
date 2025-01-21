@@ -27,6 +27,7 @@ from vyos.configdict import node_changed
 from vyos.configdiff import Diff
 from vyos.configdiff import get_config_diff
 from vyos.defaults import directories
+from vyos.pki import encode_certificate
 from vyos.pki import is_ca_certificate
 from vyos.pki import load_certificate
 from vyos.pki import load_public_key
@@ -36,9 +37,11 @@ from vyos.pki import load_private_key
 from vyos.pki import load_crl
 from vyos.pki import load_dh_parameters
 from vyos.utils.boot import boot_configuration_complete
+from vyos.utils.configfs import add_cli_node
 from vyos.utils.dict import dict_search
 from vyos.utils.dict import dict_search_args
 from vyos.utils.dict import dict_search_recursive
+from vyos.utils.file import read_file
 from vyos.utils.process import call
 from vyos.utils.process import cmd
 from vyos.utils.process import is_systemd_service_active
@@ -47,6 +50,7 @@ from vyos import airbag
 airbag.enable()
 
 vyos_certbot_dir = directories['certbot']
+vyos_ca_certificates_dir = directories['ca_certificates']
 
 # keys to recursively search for under specified path
 sync_search = [
@@ -68,7 +72,7 @@ sync_search = [
     },
     {
         'keys': ['certificate', 'ca_certificate'],
-        'path': ['load_balancing', 'reverse_proxy'],
+        'path': ['load_balancing', 'haproxy'],
     },
     {
         'keys': ['key'],
@@ -146,35 +150,15 @@ def get_config(config=None):
     if len(argv) > 1 and argv[1] == 'certbot_renew':
         pki['certbot_renew'] = {}
 
-    tmp = node_changed(conf, base + ['ca'], recursive=True, expand_nodes=Diff.DELETE | Diff.ADD)
-    if tmp:
-        if 'changed' not in pki: pki.update({'changed':{}})
-        pki['changed'].update({'ca' : tmp})
+    changed_keys = ['ca', 'certificate', 'dh', 'key-pair', 'openssh', 'openvpn']
 
-    tmp = node_changed(conf, base + ['certificate'], recursive=True, expand_nodes=Diff.DELETE | Diff.ADD)
-    if tmp:
-        if 'changed' not in pki: pki.update({'changed':{}})
-        pki['changed'].update({'certificate' : tmp})
+    for key in changed_keys:
+        tmp = node_changed(conf, base + [key], recursive=True, expand_nodes=Diff.DELETE | Diff.ADD)
 
-    tmp = node_changed(conf, base + ['dh'], recursive=True, expand_nodes=Diff.DELETE | Diff.ADD)
-    if tmp:
-        if 'changed' not in pki: pki.update({'changed':{}})
-        pki['changed'].update({'dh' : tmp})
+        if 'changed' not in pki:
+            pki.update({'changed':{}})
 
-    tmp = node_changed(conf, base + ['key-pair'], recursive=True, expand_nodes=Diff.DELETE | Diff.ADD)
-    if tmp:
-        if 'changed' not in pki: pki.update({'changed':{}})
-        pki['changed'].update({'key_pair' : tmp})
-
-    tmp = node_changed(conf, base + ['openssh'], recursive=True, expand_nodes=Diff.DELETE | Diff.ADD)
-    if tmp:
-        if 'changed' not in pki: pki.update({'changed':{}})
-        pki['changed'].update({'openssh' : tmp})
-
-    tmp = node_changed(conf, base + ['openvpn', 'shared-secret'], recursive=True, expand_nodes=Diff.DELETE | Diff.ADD)
-    if tmp:
-        if 'changed' not in pki: pki.update({'changed':{}})
-        pki['changed'].update({'openvpn' : tmp})
+        pki['changed'].update({key.replace('-', '_') : tmp})
 
     # We only merge on the defaults of there is a configuration at all
     if conf.exists(base):
@@ -414,9 +398,32 @@ def verify(pki):
 
     return None
 
+def cleanup_system_ca():
+    if not os.path.exists(vyos_ca_certificates_dir):
+        os.mkdir(vyos_ca_certificates_dir)
+    else:
+        for filename in os.listdir(vyos_ca_certificates_dir):
+            full_path = os.path.join(vyos_ca_certificates_dir, filename)
+            if os.path.isfile(full_path):
+                os.unlink(full_path)
+
 def generate(pki):
     if not pki:
+        cleanup_system_ca()
         return None
+
+    # Create or cleanup CA install directory
+    if 'changed' in pki and 'ca' in pki['changed']:
+        cleanup_system_ca()
+
+        if 'ca' in pki:
+            for ca, ca_conf in pki['ca'].items():
+                if 'system_install' in ca_conf:
+                    ca_obj = load_certificate(ca_conf['certificate'])
+                    ca_path = os.path.join(vyos_ca_certificates_dir, f'{ca}.crt')
+
+                    with open(ca_path, 'w') as f:
+                        f.write(encode_certificate(ca_obj))
 
     # Certbot renewal only needs to re-trigger the services to load up the
     # new PEM file
@@ -446,9 +453,37 @@ def generate(pki):
     # Get foldernames under vyos_certbot_dir which each represent a certbot cert
     if os.path.exists(f'{vyos_certbot_dir}/live'):
         for cert in certbot_list_on_disk:
+            # ACME certificate is no longer in use by CLI remove it
             if cert not in certbot_list:
-                # certificate is no longer active on the CLI - remove it
                 certbot_delete(cert)
+                continue
+            # ACME not enabled for individual certificate - bail out early
+            if 'acme' not in pki['certificate'][cert]:
+                continue
+
+            # Read in ACME certificate chain information
+            tmp = read_file(f'{vyos_certbot_dir}/live/{cert}/chain.pem')
+            tmp = load_certificate(tmp, wrap_tags=False)
+            cert_chain_base64 = "".join(encode_certificate(tmp).strip().split("\n")[1:-1])
+
+            # Check if CA chain certificate is already present on CLI to avoid adding
+            # a duplicate. This only checks for manual added CA certificates and not
+            # auto added ones with the AUTOCHAIN_ prefix
+            autochain_prefix = 'AUTOCHAIN_'
+            ca_cert_present = False
+            if 'ca' in pki:
+                for ca_base64, cli_path in dict_search_recursive(pki['ca'], 'certificate'):
+                    # Ignore automatic added CA certificates
+                    if any(item.startswith(autochain_prefix) for item in cli_path):
+                        continue
+                    if cert_chain_base64 == ca_base64:
+                        ca_cert_present = True
+
+            if not ca_cert_present:
+                tmp = dict_search_args(pki, 'ca', f'{autochain_prefix}{cert}', 'certificate')
+                if not bool(tmp) or tmp != cert_chain_base64:
+                    print(f'Adding/replacing automatically imported CA certificate for "{cert}" ...')
+                    add_cli_node(['pki', 'ca', f'{autochain_prefix}{cert}', 'certificate'], value=cert_chain_base64)
 
     return None
 
@@ -456,6 +491,7 @@ def apply(pki):
     systemd_certbot_name = 'certbot.timer'
     if not pki:
         call(f'systemctl stop {systemd_certbot_name}')
+        call('update-ca-certificates')
         return None
 
     has_certbot = False
@@ -472,6 +508,10 @@ def apply(pki):
 
     if 'changed' in pki:
         call_dependents()
+
+        # Rebuild ca-certificates bundle
+        if 'ca' in pki['changed']:
+            call('update-ca-certificates')
 
     return None
 
